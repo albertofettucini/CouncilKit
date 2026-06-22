@@ -70,7 +70,9 @@ struct AnthropicClient: LLMClient {
                             throw LLMError.message(ev.error?.message ?? "The provider returned an error mid-stream.")
                         }
                         if let t = ev.delta?.text { continuation.yield(.text(t)) }
-                        if let i = ev.message?.usage?.input_tokens { input = i }
+                        // Prefer the latest top-level usage (message_delta reports the revised cumulative
+                        // total, incl. cache tokens); fall back to message_start's nested usage.
+                        if let i = ev.usage?.input_tokens ?? ev.message?.usage?.input_tokens { input = i }
                         if let o = ev.usage?.output_tokens { output = o }
                     }
                     continuation.yield(.usage(input: input, output: output))

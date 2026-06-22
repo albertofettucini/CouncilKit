@@ -158,13 +158,22 @@ func run(_ opts: Options) async {
     store.newSession()
 
     // Lineup: --config > --seats > the CLI's own last lineup.
+    // An explicit CLI lineup is TRANSIENT: apply it for THIS run, but don't let setProvider/applyConfig
+    // persist it as the CLI's new default lineup/prompt (a one-off `--seats` shouldn't silently rewrite
+    // future runs). We drop persistence only around the lineup mutation, then restore it so the SESSION
+    // still saves to history.
     if let path = opts.configPath {
         guard let data = FileManager.default.contents(atPath: (path as NSString).expandingTildeInPath),
               let config = try? JSONDecoder().decode(CouncilConfig.self, from: data)
         else { die("couldn't read council config at \(path)") }
+        let wasPersistent = store.persistenceEnabled
+        store.persistenceEnabled = false
         store.applyConfig(config)
+        store.persistenceEnabled = wasPersistent
     } else if !opts.seatNames.isEmpty {
         guard opts.seatNames.count <= store.seats.count else { die("at most \(store.seats.count) seats", code: 64) }
+        let wasPersistent = store.persistenceEnabled
+        store.persistenceEnabled = false
         for (i, seat) in store.seats.enumerated() {
             if i < opts.seatNames.count {
                 guard let p = provider(named: opts.seatNames[i]) else { die("unknown provider '\(opts.seatNames[i])'", code: 64) }
@@ -173,6 +182,7 @@ func run(_ opts: Options) async {
                 store.clearProvider(seatID: seat.id)
             }
         }
+        store.persistenceEnabled = wasPersistent
     }
 
     let connected = store.seats.filter { store.hasKey($0) }

@@ -94,7 +94,7 @@ for await event in council.stream("…") {
 ## Backends — bring your own keys
 
 Claude · GPT (OpenAI) · Gemini · DeepSeek · Grok (xAI) · Mistral · Perplexity · OpenRouter ·
-Ollama (local) · Apple Intelligence (on-device) · plus two custom OpenAI-compatible endpoints
+Ollama (local) · Apple Intelligence (on-device, needs macOS 26 on Apple-silicon) · plus two custom OpenAI-compatible endpoints
 (llama.cpp, LM Studio, vLLM, a second Ollama box…).
 
 By default keys come from the **macOS Keychain** (zero config) and are sent only to each provider's own

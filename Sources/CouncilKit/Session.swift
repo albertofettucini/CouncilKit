@@ -28,6 +28,9 @@ public struct Round: Codable, Identifiable {
     /// One-round "rebuttal" (bounded debate): each advisor's revised — or held — answer after seeing
     /// where the council diverged. Empty until the user runs the debate round. Persisted.
     public var rebuttals: [Int: String] = [:]
+    /// True if this round's question carried an attached image or document. Those aren't persisted
+    /// (to keep sessions small), so per-seat Regenerate can't reproduce an attachment-based answer.
+    public var hadAttachment: Bool = false
 
     /// Seat ids that have a non-empty answer in this round.
     public var answeredSeatIDs: Set<Int> { Set(answers.filter { !$0.value.isEmpty }.keys) }
@@ -35,7 +38,7 @@ public struct Round: Codable, Identifiable {
     public enum CodingKeys: String, CodingKey {
         case id, question, answers, peerReviews, divergence, synthesis
         case inputTokens, outputTokens, costUSD, answerProviders
-        case divergenceScore, divergenceCamps, outlier, outlierSeatID, rebuttals
+        case divergenceScore, divergenceCamps, outlier, outlierSeatID, rebuttals, hadAttachment
     }
     public init(question: String) { self.question = question }
     public init(from d: Decoder) throws {
@@ -55,6 +58,7 @@ public struct Round: Codable, Identifiable {
         outlier = try? c.decodeIfPresent(String.self, forKey: .outlier)
         outlierSeatID = try? c.decodeIfPresent(Int.self, forKey: .outlierSeatID)
         rebuttals = (try? c.decode([Int: String].self, forKey: .rebuttals)) ?? [:]
+        hadAttachment = (try? c.decode(Bool.self, forKey: .hadAttachment)) ?? false
     }
 }
 

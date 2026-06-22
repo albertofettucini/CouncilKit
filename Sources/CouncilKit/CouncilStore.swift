@@ -136,7 +136,7 @@ public final class CouncilStore {
     /// Shared Round-1 system prompt — the "advisor" instruction, user-editable. A seat can
     /// override it (see `Seat.systemPrompt`). Persisted in UserDefaults (non-sensitive).
     public var sharedSystemPrompt: String = CouncilStore.defaultSystemPrompt {
-        didSet { UserDefaults.standard.set(sharedSystemPrompt, forKey: Self.promptKey) }
+        didSet { guard persistenceEnabled else { return }; UserDefaults.standard.set(sharedSystemPrompt, forKey: Self.promptKey) }
     }
 
     /// Which seat generates divergence + synthesis (and so spends that provider's credit). Persisted.
@@ -398,7 +398,7 @@ public final class CouncilStore {
     // MARK: - Round navigation + viewed accessors
 
     public var roundCount: Int { rounds.count }
-    public var isViewingLatest: Bool { viewingRound >= rounds.count - 1 }
+    public var isViewingLatest: Bool { !rounds.isEmpty && viewingRound == rounds.count - 1 }
     public var canGoPrevRound: Bool { viewingRound > 0 }
     public var canGoNextRound: Bool { viewingRound < rounds.count - 1 }
     public func prevRound() { if canGoPrevRound { viewingRound -= 1; clearDeliberationErrors() } }
@@ -409,6 +409,9 @@ public final class CouncilStore {
 
     private var viewedRound: Round? { rounds.indices.contains(viewingRound) ? rounds[viewingRound] : nil }
     public var viewedQuestion: String { viewedRound?.question ?? "" }
+    /// True if the viewed round carried an attachment — the UI uses it to disable per-seat Regenerate
+    /// (which can't reproduce an answer built from an image/document Council doesn't persist).
+    public var viewedRoundHadAttachment: Bool { viewedRound?.hadAttachment ?? false }
     public func viewedAnswer(_ seatID: Int) -> String? { viewedRound?.answers[seatID] }
     public func viewedPeerReview(_ seatID: Int) -> String? { viewedRound?.peerReviews[seatID] }
     /// Provider name recorded for this seat's answer in the viewed round (for the panel title when
@@ -439,18 +442,21 @@ public final class CouncilStore {
     public var sessionCostUSD: Double { rounds.reduce(0) { $0 + $1.costUSD } }
 
     // MARK: Dashboard aggregates (all saved sessions; the current session joins after its first save).
-    public var allTimeCostUSD: Double { sessions.reduce(0) { $0 + $1.totalCostUSD } }
-    public var thisMonthCostUSD: Double {
-        let cal = Calendar.current
-        return sessions
-            .filter { cal.isDate($0.updatedAt, equalTo: Date(), toGranularity: .month) }
-            .reduce(0) { $0 + $1.totalCostUSD }
-    }
+    // Cached — recomputed only when `sessions` actually changes (its didSet), not on every render.
+    public private(set) var allTimeCostUSD: Double = 0
+    public private(set) var thisMonthCostUSD: Double = 0
     /// Most-used model (panel name) across all rounds, for the dashboard's "top model".
-    public var topModelName: String? {
-        var counts: [String: Int] = [:]
-        for s in sessions { for r in s.rounds { for name in r.answerProviders.values { counts[name, default: 0] += 1 } } }
-        return counts.max { $0.value < $1.value }?.key
+    public private(set) var topModelName: String?
+    private func recomputeDashboardAggregates() {
+        var all = 0.0, month = 0.0, counts: [String: Int] = [:]
+        let cal = Calendar.current, now = Date()
+        for s in sessions {
+            all += s.totalCostUSD
+            if cal.isDate(s.updatedAt, equalTo: now, toGranularity: .month) { month += s.totalCostUSD }
+            for r in s.rounds { for name in r.answerProviders.values { counts[name, default: 0] += 1 } }
+        }
+        allTimeCostUSD = all; thisMonthCostUSD = month
+        topModelName = counts.max { $0.value < $1.value }?.key
     }
     /// Whether a key exists for this provider — reads the cache, never the Keychain (so it's safe
     /// to call from a view body). Key-free providers (Ollama) are always "ready".
@@ -489,17 +495,20 @@ public final class CouncilStore {
               d.double(forKey: Self.spendAlertFiredKey) < threshold else { return }
         let spent = allTimeCostUSD
         let firedKey = Self.spendAlertFiredKey   // capture plain Sendable values only (no `self`/`center`)
-        // Only burn the one-shot once we KNOW we can actually notify — if authorization was denied,
-        // don't set firedAt, so it retries (and fires) once the user grants permission.
+        // Claim the one-shot SYNCHRONOUSLY (we're on the MainActor) so two near-simultaneous saves
+        // can't both pass the guard above and double-post. Roll back only if we can't actually notify.
+        d.set(threshold, forKey: firedKey)
         UNUserNotificationCenter.current().getNotificationSettings { settings in
-            guard settings.authorizationStatus == .authorized else { return }
+            guard settings.authorizationStatus == .authorized else {
+                UserDefaults.standard.removeObject(forKey: firedKey)   // denied → re-arm so it retries once granted
+                return
+            }
             let content = UNMutableNotificationContent()
             content.title = "Council — spend alert"
             content.body = String(format: "You've spent about $%.2f, past your $%.2f alert.", spent, threshold)
             content.sound = .default
             UNUserNotificationCenter.current().add(
                 UNNotificationRequest(identifier: "council.spendAlert", content: content, trigger: nil))
-            UserDefaults.standard.set(threshold, forKey: firedKey)
         }
     }
 
@@ -562,6 +571,7 @@ public final class CouncilStore {
         let keyed = seats.filter { hasKey($0) }
         guard !keyed.isEmpty else { return }
         var round = Round(question: question)
+        round.hadAttachment = (image != nil || doc != nil)   // see Round.hadAttachment — gates Regenerate
         for seat in keyed { round.answers[seat.id] = "" }   // in-progress slots
         rounds.append(round)
         let idx = rounds.count - 1
@@ -594,8 +604,10 @@ public final class CouncilStore {
         let answered = answeredSeats(in: idx)
         guard answered.count >= 2, rounds.indices.contains(idx) else { return }
         let pairs = answered.map { (seat: $0, answer: rounds[idx].answers[$0.id] ?? "") }
+        let names = uniqueNames(for: answered)
         deliberationBusy = true
         generatingRound = idx
+        pipelineStage = "Peer review"
         for s in answered { status[s.id] = .loading; rounds[idx].peerReviews[s.id] = "" }
         // Re-running peer review invalidates the rebuttal round that followed the OLD reviews —
         // clear it so DEBATE unlocks again instead of showing a stale final take.
@@ -609,7 +621,7 @@ public final class CouncilStore {
                 var remap: [String: String] = [:]
                 let othersText = others.enumerated().map { i, p -> String in
                     let label = "Advisor \(String(UnicodeScalar(65 + i)!))"
-                    remap[label] = p.seat.provider?.panelName ?? "Advisor"
+                    remap[label] = names[p.seat.id] ?? "Advisor"
                     return "\(label) said:\n\(p.answer)"
                 }.joined(separator: "\n\n")
                 let reviewText = """
@@ -633,7 +645,7 @@ public final class CouncilStore {
                         }
                     }
                     guard self.rounds.indices.contains(idx) else { return }
-                    if let text = r.text {
+                    if let text = r.text, !r.cancelled {
                         self.rounds[idx].peerReviews[seat.id] = self.deAnonymize(text, remap)
                         self.status[seat.id] = .idle
                         self.addRoundUsage(idx, seat, r)
@@ -648,6 +660,7 @@ public final class CouncilStore {
         }
         deliberationBusy = false
         generatingRound = nil
+        pipelineStage = nil
         saveConversation()
     }
 
@@ -663,6 +676,7 @@ public final class CouncilStore {
         pipelineStage = "Debate"
         for s in answered { status[s.id] = .loading; rounds[idx].rebuttals[s.id] = "" }
         let pairs = answered.map { (seat: $0, answer: rounds[idx].answers[$0.id] ?? "") }
+        let names = uniqueNames(for: answered)
 
         await withTaskGroup(of: Void.self) { group in
             for seat in answered {
@@ -674,7 +688,7 @@ public final class CouncilStore {
                 var remap: [String: String] = [:]
                 let ctx = others.enumerated().map { i, p -> String in
                     let label = "Advisor \(String(UnicodeScalar(65 + i)!))"
-                    remap[label] = p.seat.provider?.panelName ?? "Advisor"
+                    remap[label] = names[p.seat.id] ?? "Advisor"
                     return "\(label):\n\(p.answer)"
                 }.joined(separator: "\n\n")
                 let prompt = """
@@ -747,6 +761,7 @@ public final class CouncilStore {
         let idx = viewingRound
         guard canDeliberate(idx), let seat = synthesizerSeat, rounds.indices.contains(idx) else { return }
         deliberationBusy = true
+        pipelineStage = "Divergence"
         divergenceError = nil
         // Don't wipe an existing divergence up front: on a failed REGEN the prior good text stays,
         // and the stream replaces it from the first token on success.
@@ -763,6 +778,7 @@ public final class CouncilStore {
             else if !r.cancelled { divergenceError = r.error ?? "Failed" }   // transient, never persisted as content
         }
         deliberationBusy = false
+        pipelineStage = nil
         saveConversation()
     }
 
@@ -770,6 +786,7 @@ public final class CouncilStore {
         let idx = viewingRound
         guard canDeliberate(idx), let seat = synthesizerSeat, rounds.indices.contains(idx) else { return }
         deliberationBusy = true
+        pipelineStage = "Synthesis"
         synthesisError = nil
         let (ctx, remap, _) = anonymizedContext(idx)
         let context = "Question:\n\(rounds[idx].question)\n\nThe advisors' answers (anonymized):\n\n\(ctx)"
@@ -781,6 +798,7 @@ public final class CouncilStore {
             else if !r.cancelled { synthesisError = r.error ?? "Failed" }   // transient, never persisted as content
         }
         deliberationBusy = false
+        pipelineStage = nil
         saveConversation()
     }
 
@@ -789,6 +807,13 @@ public final class CouncilStore {
         let idx = rounds.count - 1
         guard idx == viewingRound, rounds.indices.contains(idx), !anyLoading,
               let seat = seats.first(where: { $0.id == seatID }), hasKey(seat) else { return }
+        // The original answer used an attached image/document, which isn't kept in the saved round (by
+        // design). We can't reproduce it, so refuse rather than silently re-ask the model about an
+        // attachment it never receives — which would yield a confident answer about nothing.
+        if rounds[idx].hadAttachment {
+            status[seatID] = .failed("Can't regenerate — this answer used an attachment, which Council doesn't keep. Start a new directive to re-attach it.")
+            return
+        }
         let q = rounds[idx].question
         // Only drop this seat's last exchange from history if it actually succeeded (so a
         // retry-after-failure doesn't wrongly delete a previous round's exchange).
@@ -878,22 +903,41 @@ public final class CouncilStore {
     /// anonymous label back to the real provider name (used to restore attribution in the output).
     private func anonymizedContext(_ idx: Int) -> (context: String, remap: [String: String], seatByLabel: [String: Int]) {
         let answered = answeredSeats(in: idx).shuffled()
+        let names = uniqueNames(for: answered)
         var blocks: [String] = []
         var remap: [String: String] = [:]
         var seatByLabel: [String: Int] = [:]   // lowercased label → seat id (verdict outlier resolution)
         for (i, s) in answered.enumerated() {
             let label = "Advisor \(String(UnicodeScalar(65 + i)!))"   // Advisor A, B, C…
-            remap[label] = s.provider?.panelName ?? "Advisor"
+            remap[label] = names[s.id] ?? s.provider?.panelName ?? "Advisor"
             seatByLabel[label.lowercased()] = s.id
             blocks.append("\(label):\n\(rounds[idx].answers[s.id] ?? "")")
         }
         return (blocks.joined(separator: "\n\n"), remap, seatByLabel)
     }
 
-    /// Put the real provider names back into a generated artifact, for display.
+    /// Put the real provider names back into a generated artifact, for display. Process labels
+    /// longest-first so a shorter label ("Advisor A") can't garble a longer one ("Advisor AB") as a
+    /// substring; `uniqueNames` keeps the target names distinct so duplicate providers stay readable.
     private func deAnonymize(_ text: String, _ remap: [String: String]) -> String {
         var out = text
-        for (label, name) in remap { out = out.replacingOccurrences(of: label, with: name) }
+        for label in remap.keys.sorted(by: { $0.count > $1.count }) {
+            out = out.replacingOccurrences(of: label, with: remap[label] ?? label)
+        }
+        return out
+    }
+
+    /// Map each seat to a UNIQUE display name. Two seats on the same provider would otherwise both
+    /// de-anonymize to e.g. "Claude" and become indistinguishable to the reader — append "(1)"/"(2)"
+    /// only when there is an actual collision.
+    private func uniqueNames(for seats: [Seat]) -> [Int: String] {
+        let counts = Dictionary(grouping: seats) { $0.provider?.panelName ?? "Advisor" }.mapValues(\.count)
+        var seen: [String: Int] = [:]; var out: [Int: String] = [:]
+        for s in seats {
+            let base = s.provider?.panelName ?? "Advisor"
+            if (counts[base] ?? 0) > 1 { let n = (seen[base] ?? 0) + 1; seen[base] = n; out[s.id] = "\(base) (\(n))" }
+            else { out[s.id] = base }
+        }
         return out
     }
 
@@ -1148,7 +1192,7 @@ public final class CouncilStore {
 
     // MARK: - Sessions (local multi-session history — one JSON file each, no server)
 
-    public var sessions: [Session] = []
+    public var sessions: [Session] = [] { didSet { recomputeDashboardAggregates() } }
     private var currentSessionID = UUID()
     private var currentTitle = ""
     private var currentCreatedAt = Date()
@@ -1216,7 +1260,8 @@ public final class CouncilStore {
         s.decision = prior?.decision; s.decisionAt = prior?.decisionAt
         s.outcome = prior?.outcome; s.outcomeAt = prior?.outcomeAt
         if let url = sessionURL(s.id), let data = try? Self.sessionCoder.enc.encode(s) {
-            try? data.write(to: url, options: .atomic)
+            // Atomic disk write off the MainActor (Data is Sendable) so the I/O doesn't hitch the UI.
+            Task.detached(priority: .utility) { try? data.write(to: url, options: .atomic) }
         }
         sessions.removeAll { $0.id == s.id }
         sessions.insert(s, at: 0)

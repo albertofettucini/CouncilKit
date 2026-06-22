@@ -47,7 +47,15 @@ struct OpenAICompatibleClient: LLMClient {
     /// failure we retry once WITHOUT it, since capable models follow the JSON instruction anyway.
     func judge(messages: [ChatMessage], apiKey: String) async throws -> String {
         do { return try await judgeOnce(messages, apiKey: apiKey, jsonMode: true) }
-        catch { return try await judgeOnce(messages, apiKey: apiKey, jsonMode: false) }
+        catch {
+            // Retry without JSON mode for the "provider doesn't support response_format" case (the
+            // reason this two-attempt path exists). Fail fast on errors a no-JSON retry can't fix —
+            // a 401/403/404 would just fail identically, doubling the latency of a doomed call.
+            let m = error.localizedDescription.lowercased()
+            if m.contains("401") || m.contains("403") || m.contains("404")
+                || m.contains("unauthorized") || m.contains("not found") { throw error }
+            return try await judgeOnce(messages, apiKey: apiKey, jsonMode: false)
+        }
     }
 
     private func judgeOnce(_ messages: [ChatMessage], apiKey: String, jsonMode: Bool) async throws -> String {
@@ -92,8 +100,16 @@ struct OpenAICompatibleClient: LLMClient {
                         }
                         return RequestBody.Message(role: msg.role.rawValue, content: .text(msg.text))
                     }
+                    // `stream_options` is an OpenAI extension. Send it only to hosts known to honor it
+                    // (so we still get usage from OpenAI / OpenRouter / Gemini); omit it for arbitrary
+                    // custom servers (llama.cpp / vLLM / LM Studio), some of which 400 on unknown fields
+                    // — which would abort the whole answer just to chase best-effort token counts.
+                    let knownUsageHost: Bool = {
+                        guard let h = endpoint.host else { return false }
+                        return h.hasSuffix("openai.com") || h.hasSuffix("openrouter.ai") || h.hasSuffix("googleapis.com")
+                    }()
                     let body = RequestBody(model: model, messages: wire, max_tokens: maxTokens, stream: true,
-                                           stream_options: .init(include_usage: true),
+                                           stream_options: knownUsageHost ? .init(include_usage: true) : nil,
                                            temperature: isReasoningModel ? nil : temperature)
                     request.httpBody = try JSONEncoder().encode(body)
 
