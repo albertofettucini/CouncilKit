@@ -29,6 +29,11 @@ public enum CouncilLimits {
 public final class CouncilStore {
     public var seats: [Seat]
     public var status: [Int: SeatStatus] = [:]
+    /// Live streaming text per seat for the round being generated. Token writes land HERE, not in
+    /// `rounds`, so a ~30fps stream doesn't invalidate every view that reads `rounds` (round navigator,
+    /// dashboard, cost line…) — only the panels, which read it via `viewedAnswer`. Committed to
+    /// `rounds[idx].answers` in finishAnswer.
+    public var liveAnswers: [Int: String] = [:]
     /// All rounds in the current session, oldest → newest.
     public var rounds: [Round] = []
     /// Which round the UI is showing (analyses + answers are read from this round).
@@ -412,7 +417,11 @@ public final class CouncilStore {
     /// True if the viewed round carried an attachment — the UI uses it to disable per-seat Regenerate
     /// (which can't reproduce an answer built from an image/document Council doesn't persist).
     public var viewedRoundHadAttachment: Bool { viewedRound?.hadAttachment ?? false }
-    public func viewedAnswer(_ seatID: Int) -> String? { viewedRound?.answers[seatID] }
+    public func viewedAnswer(_ seatID: Int) -> String? {
+        // While this seat is streaming into the viewed (generating) round, read the live buffer.
+        if generatingRound == viewingRound, let live = liveAnswers[seatID] { return live }
+        return viewedRound?.answers[seatID]
+    }
     public func viewedPeerReview(_ seatID: Int) -> String? { viewedRound?.peerReviews[seatID] }
     /// Provider name recorded for this seat's answer in the viewed round (for the panel title when
     /// the seat itself is currently unassigned, e.g. a reopened session).
@@ -856,7 +865,7 @@ public final class CouncilStore {
 
     private func setAnswer(_ idx: Int, _ seatID: Int, _ text: String) {
         guard rounds.indices.contains(idx) else { return }
-        rounds[idx].answers[seatID] = text
+        liveAnswers[seatID] = text   // #15: stream into the live buffer; committed to rounds in finishAnswer
     }
 
     private func finishAnswer(roundIndex idx: Int, seat: Seat, question: String, result r: StreamResult) {
@@ -880,6 +889,7 @@ public final class CouncilStore {
             rounds[idx].answers[id] = nil   // hard failure → drop the empty in-progress slot
             status[id] = .failed(r.error ?? "Unknown error")
         }
+        liveAnswers[id] = nil   // streaming finished → viewedAnswer falls back to the committed rounds value
     }
 
     /// Optional price override (the CouncilKit facade) so a stale built-in price can't silently
@@ -1254,7 +1264,7 @@ public final class CouncilStore {
         let prior = sessions.first { $0.id == currentSessionID }
         var s = Session(id: currentSessionID, title: currentTitle,
                         createdAt: currentCreatedAt, updatedAt: Date(),
-                        rounds: rounds, history: history)
+                        rounds: rounds, history: [:])   // history is reconstructed from rounds on load — not persisted
         // Carry the decision-journal fields forward — they live out-of-band from the live round state,
         // so a plain rebuild would silently wipe them on the next save.
         s.decision = prior?.decision; s.decisionAt = prior?.decisionAt
@@ -1294,12 +1304,29 @@ public final class CouncilStore {
         }
     }
 
+    /// Rebuild each seat's replay history from saved rounds. `history` is no longer persisted in the
+    /// session file (it duplicated every answer's full text); we reconstruct it on load, mirroring how
+    /// finishAnswer builds it incrementally — one user(question)+assistant(answer) pair per round the
+    /// seat answered, in round order. Sessions saved before this still carry `history`, used as-is.
+    static func reconstructHistory(from rounds: [Round]) -> [Int: [ChatMessage]] {
+        var h: [Int: [ChatMessage]] = [:]
+        for r in rounds {
+            for (seatID, answer) in r.answers where !answer.isEmpty {
+                h[seatID, default: []].append(.user(r.question))
+                h[seatID, default: []].append(.assistant(answer))
+            }
+        }
+        return h
+    }
+
     private func apply(_ s: Session) {
         currentSessionID = s.id
         currentTitle = s.title
         currentCreatedAt = s.createdAt
         rounds = s.rounds
-        history = s.history
+        // Reconstruct replay history from rounds (no longer persisted); fall back to an older
+        // session's stored history if present.
+        history = s.history.isEmpty ? Self.reconstructHistory(from: s.rounds) : s.history
         viewingRound = max(0, rounds.count - 1)
         status = [:]
         clearDeliberationErrors()
@@ -1318,6 +1345,7 @@ public final class CouncilStore {
         rounds = []
         viewingRound = 0
         status = [:]
+        liveAnswers = [:]
         history = [:]
         clearDeliberationErrors()
     }

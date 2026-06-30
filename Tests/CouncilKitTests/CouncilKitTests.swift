@@ -24,6 +24,26 @@ final class CouncilKitTests: XCTestCase {
         super.tearDown()
     }
 
+    // MARK: - History reconstruction (#12: history is no longer persisted; rebuilt from rounds on load)
+
+    @MainActor
+    func testReconstructHistoryFromRounds() {
+        var r1 = Round(question: "Q1"); r1.answers = [0: "A1-0", 1: "A1-1"]
+        var r2 = Round(question: "Q2"); r2.answers = [0: "A2-0"]   // seat 1 didn't answer round 2
+        let h = CouncilStore.reconstructHistory(from: [r1, r2])
+        XCTAssertEqual(h[0]?.map(\.role), [.user, .assistant, .user, .assistant])
+        XCTAssertEqual(h[0]?.map(\.text), ["Q1", "A1-0", "Q2", "A2-0"])   // round order preserved
+        XCTAssertEqual(h[1]?.map(\.text), ["Q1", "A1-1"])                 // only the round it answered
+    }
+
+    @MainActor
+    func testReconstructHistorySkipsEmptyAnswers() {
+        var r = Round(question: "Q"); r.answers = [0: "", 1: "real"]   // seat 0 has no answer yet
+        let h = CouncilStore.reconstructHistory(from: [r])
+        XCTAssertNil(h[0])                                              // empty answer → no history entry
+        XCTAssertEqual(h[1]?.map(\.text), ["Q", "real"])
+    }
+
     // MARK: - Public API shape
 
     func testGptAliasMapsToOpenAI() {
