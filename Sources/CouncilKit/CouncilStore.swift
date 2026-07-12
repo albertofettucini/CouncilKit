@@ -22,6 +22,17 @@ public enum CouncilLimits {
     }
 }
 
+/// Serializes the streaming pump's fire-and-forget UI flushes: at most ONE hop to the MainActor is
+/// in flight per stream (extra ticks are dropped, not queued — a blocked main thread never builds a
+/// backlog), and `waitUntilIdle` lets the caller order its authoritative final flush after any
+/// stragglers.
+actor FlushGate {
+    private var busy = false
+    func tryEnter() -> Bool { if busy { return false }; busy = true; return true }
+    func leave() { busy = false }
+    func waitUntilIdle() async { while busy { await Task.yield() } }
+}
+
 /// Central app state. A session is a list of `Round`s; each round keeps its own answers,
 /// peer reviews, divergence and synthesis. The user navigates rounds; nothing is wiped.
 @MainActor
@@ -34,6 +45,14 @@ public final class CouncilStore {
     /// dashboard, cost line…) — only the panels, which read it via `viewedAnswer`. Committed to
     /// `rounds[idx].answers` in finishAnswer.
     public var liveAnswers: [Int: String] = [:]
+    /// Live streaming buffers for the DELIBERATION stages, mirroring `liveAnswers`: partial text
+    /// lands here (RAW — de-anonymized only once, at commit), so a token tick doesn't mutate
+    /// `rounds` and invalidate every rounds-reader in both windows ~30×/sec. Committed into the
+    /// round in each stage's finish block, then cleared.
+    public var livePeerReviews: [Int: String] = [:]
+    public var liveRebuttals: [Int: String] = [:]
+    public var liveDivergence: String?
+    public var liveSynthesis: String?
     /// All rounds in the current session, oldest → newest.
     public var rounds: [Round] = []
     /// Which round the UI is showing (analyses + answers are read from this round).
@@ -333,11 +352,17 @@ public final class CouncilStore {
         return keyExists(provider)
     }
 
-    public func setKey(_ key: String, for provider: LLMProvider) {
+    /// Save a key to the Keychain. Returns false when the WRITE failed — callers must surface it.
+    /// (This used to `try?`-swallow the error: a failed save looked exactly like success, the seat
+    /// showed as connected, and the next call failed with "API key not found".)
+    @discardableResult
+    public func setKey(_ key: String, for provider: LLMProvider) -> Bool {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        try? KeychainStore.save(trimmed, account: provider.keychainAccount)
+        guard !trimmed.isEmpty else { return false }
+        do { try KeychainStore.save(trimmed, account: provider.keychainAccount) }
+        catch { return false }
         keyRevision += 1
+        return true
     }
 
     public func clearKey(for provider: LLMProvider) {
@@ -351,7 +376,9 @@ public final class CouncilStore {
         guard !trimmed.isEmpty else { return "Empty key." }
         let client = LLMClientFactory.make(for: provider, model: seat.model)
         do { try await client.validate(apiKey: trimmed) } catch { return error.localizedDescription }
-        setKey(trimmed, for: provider)
+        guard setKey(trimmed, for: provider) else {
+            return "Key verified, but saving it to the macOS Keychain failed. Quit any other running Council copies and try again."
+        }
         return nil
     }
 
@@ -422,13 +449,17 @@ public final class CouncilStore {
         if generatingRound == viewingRound, let live = liveAnswers[seatID] { return live }
         return viewedRound?.answers[seatID]
     }
-    public func viewedPeerReview(_ seatID: Int) -> String? { viewedRound?.peerReviews[seatID] }
+    public func viewedPeerReview(_ seatID: Int) -> String? {
+        // Streaming reads come from the live buffer; committed text takes over on finish.
+        if generatingRound == viewingRound, let live = livePeerReviews[seatID] { return live }
+        return viewedRound?.peerReviews[seatID]
+    }
     /// Provider name recorded for this seat's answer in the viewed round (for the panel title when
     /// the seat itself is currently unassigned, e.g. a reopened session).
     public func viewedAnswerProvider(_ seatID: Int) -> String? { viewedRound?.answerProviders[seatID] }
     /// Read-only views of the current round's cross-model artifacts (used by the UI).
-    public var divergenceText: String? { viewedRound?.divergence }
-    public var synthesisText: String? { viewedRound?.synthesis }
+    public var divergenceText: String? { liveDivergence ?? viewedRound?.divergence }
+    public var synthesisText: String? { liveSynthesis ?? viewedRound?.synthesis }
     /// The verdict's AGREEMENT score (0–100). Named honestly — the UI shows 100 − this as divergence.
     public var agreementScore: Int? { viewedRound?.divergenceScore }
     public var divergenceCamps: Int? { viewedRound?.divergenceCamps }
@@ -551,6 +582,7 @@ public final class CouncilStore {
     }
     /// The revised (or held) answer a seat gave in the rebuttal round, if any.
     public func viewedRebuttal(_ seatID: Int) -> String? {
+        if generatingRound == viewingRound, let live = liveRebuttals[seatID], !live.isEmpty { return live }
         guard let r = viewedRound?.rebuttals[seatID], !r.isEmpty else { return nil }
         return r
     }
@@ -649,10 +681,9 @@ public final class CouncilStore {
                 let messages = [ChatMessage.system(reviewSystem), .user(reviewText)]
                 group.addTask { @MainActor in
                     let r = await self.streamCall(seat: seat, messages: messages) { partial in
-                        if self.rounds.indices.contains(idx) {
-                            self.rounds[idx].peerReviews[seat.id] = self.deAnonymize(partial, remap)
-                        }
+                        self.livePeerReviews[seat.id] = partial   // raw buffer — no rounds churn per tick
                     }
+                    self.livePeerReviews[seat.id] = nil
                     guard self.rounds.indices.contains(idx) else { return }
                     if let text = r.text, !r.cancelled {
                         self.rounds[idx].peerReviews[seat.id] = self.deAnonymize(text, remap)
@@ -720,10 +751,9 @@ public final class CouncilStore {
                 let messages = [ChatMessage.system(systemPrompt(for: seat)), .user(prompt)]
                 group.addTask { @MainActor in
                     let r = await self.streamCall(seat: seat, messages: messages) { partial in
-                        if self.rounds.indices.contains(idx) {
-                            self.rounds[idx].rebuttals[seat.id] = self.deAnonymize(partial, remap)
-                        }
+                        self.liveRebuttals[seat.id] = partial   // raw buffer — no rounds churn per tick
                     }
+                    self.liveRebuttals[seat.id] = nil
                     guard self.rounds.indices.contains(idx) else { return }
                     if let text = r.text, !r.cancelled {
                         self.rounds[idx].rebuttals[seat.id] = self.deAnonymize(text, remap)
@@ -777,8 +807,9 @@ public final class CouncilStore {
         let (ctx, remap, seatByLabel) = anonymizedContext(idx)
         let user = "Question:\n\(rounds[idx].question)\n\nThe advisors' answers (anonymized):\n\n\(ctx)"
         let r = await streamCall(seat: seat, messages: [.system(Self.divergencePrompt), .user(user)]) { partial in
-            if self.rounds.indices.contains(idx) { self.rounds[idx].divergence = self.deAnonymize(partial, remap) }
+            self.liveDivergence = partial   // raw buffer — no rounds churn per tick
         }
+        liveDivergence = nil   // a failed/cancelled regen falls back to the prior committed text
         if rounds.indices.contains(idx) {
             if let t = r.text, !r.cancelled {
                 rounds[idx].divergence = deAnonymize(t, remap); addRoundUsage(idx, seat, r)
@@ -800,8 +831,9 @@ public final class CouncilStore {
         let (ctx, remap, _) = anonymizedContext(idx)
         let context = "Question:\n\(rounds[idx].question)\n\nThe advisors' answers (anonymized):\n\n\(ctx)"
         let r = await streamCall(seat: seat, messages: [.system(Self.synthesisPrompt), .user(context)]) { partial in
-            if self.rounds.indices.contains(idx) { self.rounds[idx].synthesis = self.deAnonymize(partial, remap) }
+            self.liveSynthesis = partial   // raw buffer — no rounds churn per tick
         }
+        liveSynthesis = nil   // a failed/cancelled regen falls back to the prior committed text
         if rounds.indices.contains(idx) {
             if let t = r.text, !r.cancelled { rounds[idx].synthesis = deAnonymize(t, remap); addRoundUsage(idx, seat, r) }
             else if !r.cancelled { synthesisError = r.error ?? "Failed" }   // transient, never persisted as content
@@ -855,6 +887,8 @@ public final class CouncilStore {
         deliberationBusy = false
         generatingRound = nil
         pipelineStage = nil
+        livePeerReviews = [:]; liveRebuttals = [:]
+        liveDivergence = nil; liveSynthesis = nil
     }
 
     // MARK: - Round helpers
@@ -864,7 +898,8 @@ public final class CouncilStore {
     }
 
     private func setAnswer(_ idx: Int, _ seatID: Int, _ text: String) {
-        guard rounds.indices.contains(idx) else { return }
+        // The status guard drops any straggler flush that lands after finishAnswer settled the seat.
+        guard rounds.indices.contains(idx), status[seatID] == .loading else { return }
         liveAnswers[seatID] = text   // #15: stream into the live buffer; committed to rounds in finishAnswer
     }
 
@@ -1025,47 +1060,64 @@ public final class CouncilStore {
         let client = LLMClientFactory.make(for: provider, model: seat.model,
                                            temperature: seat.temperature, maxTokens: seat.maxTokens,
                                            endpoint: transientCustomEndpoints[seat.id])
-        // Coalesce token updates to ~30fps. Streaming fires hundreds of deltas/answer; pushing
-        // every one into the UI re-renders + re-parses markdown each time (O(n²)). We only flush
-        // to the UI every ~33ms, and always flush the final text after the loop.
-        let minInterval: UInt64 = 33_000_000   // 33ms in ns
-
         // One automatic retry on a transient connection drop (flaky Wi-Fi, an SSH-tunnelled remote
         // Ollama, a brief blip). The long streaming connection is what tends to fail, so we re-run
         // from scratch once before surfacing the error — the seat stays in its loading state throughout.
+        let gate = FlushGate()
         var lastError: Error = LLMError.message("Failed")
         for attempt in 0..<2 {
-            var full = "", input = 0, output = 0
-            var lastEmit: UInt64 = 0
-            var pending = false
-            do {
-                for try await chunk in client.stream(messages: messages, apiKey: apiKey) {
-                    try Task.checkCancellation()   // Stop → exit → stream terminates → network cancels
-                    switch chunk {
-                    case .text(let t):
-                        full += t
-                        let now = DispatchTime.now().uptimeNanoseconds
-                        if now &- lastEmit >= minInterval { lastEmit = now; pending = false; onDelta(full) }
-                        else { pending = true }
-                    case .usage(let i, let o): input = i; output = o
-                    }
-                }
-                if pending { onDelta(full) }   // flush the last buffered text
-                return (full, input, output, false, nil)
-            } catch {
-                if pending { onDelta(full) }   // flush whatever streamed before the error/cancel
+            let r = await Self.pump(client: client, messages: messages, apiKey: apiKey,
+                                    gate: gate, onDelta: onDelta)
+            await gate.waitUntilIdle()             // the final flush below must be ordered LAST
+            if !r.text.isEmpty { onDelta(r.text) } // authoritative full/partial text, on the MainActor
+            if let error = r.error {
                 if error is CancellationError || (error as? URLError)?.code == .cancelled {
-                    return (full.isEmpty ? nil : full, input, output, true, nil)
+                    return (r.text.isEmpty ? nil : r.text, r.input, r.output, true, nil)
                 }
                 lastError = error
                 if attempt == 0, !Task.isCancelled, Self.isTransient(error) {
                     try? await Task.sleep(nanoseconds: 500_000_000)   // brief backoff, then re-run once
                     continue
                 }
-                return (nil, input, output, false, Self.friendlyError(error, provider: provider))
+                return (nil, r.input, r.output, false, Self.friendlyError(error, provider: provider))
             }
+            return (r.text, r.input, r.output, false, nil)
         }
         return (nil, 0, 0, false, Self.friendlyError(lastError, provider: provider))
+    }
+
+    /// The network pump — deliberately `nonisolated`, so it runs on the GLOBAL executor, never the
+    /// MainActor. A main-thread stall (a held text-selection mouse-tracking loop, a menu, a heavy
+    /// commit) must not stall the model streams — it used to: every SSE chunk hopped through the
+    /// MainActor, so holding the mouse down over text froze all three answers mid-flight.
+    /// UI flushes are throttled (10Hz/seat), FIRE-AND-FORGET (never block the network), and
+    /// serialized through `gate` so at most one is in flight and the caller's final flush wins.
+    private nonisolated static func pump(
+        client: any LLMClient, messages: [ChatMessage], apiKey: String,
+        gate: FlushGate, onDelta: @escaping @MainActor (String) -> Void
+    ) async -> (text: String, input: Int, output: Int, error: Error?) {
+        let minInterval: UInt64 = 100_000_000   // 100ms — 10Hz per seat; 3 seats ≈ 30 UI flushes/sec
+        var full = "", input = 0, output = 0
+        var lastEmit: UInt64 = 0
+        do {
+            for try await chunk in client.stream(messages: messages, apiKey: apiKey) {
+                try Task.checkCancellation()   // Stop → exit → stream terminates → network cancels
+                switch chunk {
+                case .text(let t):
+                    full += t
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    if now &- lastEmit >= minInterval, await gate.tryEnter() {
+                        lastEmit = now
+                        let snapshot = full
+                        Task { @MainActor in onDelta(snapshot); await gate.leave() }
+                    }
+                case .usage(let i, let o): input = i; output = o
+                }
+            }
+            return (full, input, output, nil)
+        } catch {
+            return (full, input, output, error)   // partial text survives cancel/failure
+        }
     }
 
     /// A transient connection failure worth one automatic retry (vs a permanent auth/model error,
@@ -1346,6 +1398,8 @@ public final class CouncilStore {
         viewingRound = 0
         status = [:]
         liveAnswers = [:]
+        livePeerReviews = [:]; liveRebuttals = [:]
+        liveDivergence = nil; liveSynthesis = nil
         history = [:]
         clearDeliberationErrors()
     }

@@ -33,8 +33,9 @@ public enum StreamChunk: Sendable {
 }
 
 /// A uniform interface over every LLM backend. Each provider has its own wire format
-/// under the hood, but callers only ever see these methods.
-public protocol LLMClient {
+/// under the hood, but callers only ever see these methods. `Sendable` so the streaming pump can
+/// run OFF the MainActor (all conformers are small value types).
+public protocol LLMClient: Sendable {
     /// Token-by-token stream. Yields text deltas as they arrive, then a usage chunk.
     func stream(messages: [ChatMessage], apiKey: String) -> AsyncThrowingStream<StreamChunk, Error>
     /// Cheap key check: makes a tiny authenticated call. Returns normally if the key
