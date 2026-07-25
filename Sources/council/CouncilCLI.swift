@@ -32,6 +32,10 @@ struct Options {
     var noSave = false
     var allowEnvKeys = false
     var filePath: String?
+    var guestPath: String?
+    var guestName: String?
+    var deliberateNames: [String]?
+    var chairName: String?
 }
 
 let usage = """
@@ -49,18 +53,28 @@ FLAGS
   --seats a,b,c             ad-hoc lineup with default personas
                             (claude gpt gemini deepseek grok mistral perplexity
                              openrouter ollama apple custom1 custom2)
+  --guest <path>            paste an external AI's answer (from a file) into the round —
+                            it joins blind peer review as one more anonymous advisor
+  --guest-name <name>       guest label, revealed only AFTER deliberation (default "Guest")
+  --deliberate a,b[,guest]  only these answers enter peer review / divergence / synthesis
+  --chair <provider>        neutral chair for THIS run: it moderates (divergence + synthesis)
+                            but never answers the question itself. If it can't run, an advisor
+                            writes them instead and the run says so
   --json                    full structured result on stdout (schema council.cli.v1)
   --md [-o file.md]         decision memo (markdown) on stdout or to a file
-  --quiet                   synthesis only
-  -v                        include full peer reviews / rebuttals
+  --quiet                   synthesis only (bare text, no headers)
+  -v                        include the full peer reviews (the CLI doesn't run the debate round)
   --fail-above <N>          exit 1 if displayed divergence > N (CI gating)
   --no-save                 don't write the session into the app's history
-  --allow-env-keys          CI only: COUNCIL_KEY_<PROVIDER> env vars may supply keys
+  --allow-env-keys          CI only: COUNCIL_KEY_<PROVIDER> env vars may supply keys. The suffix is
+                            the provider id, not the seat name: CLAUDE OPENAI (not GPT) GEMINI
+                            DEEPSEEK GROK MISTRAL PERPLEXITY OPENROUTER
 
 EXIT CODES   0 ok · 1 divergence gate tripped · 2 runtime error · 64 usage error
 
-Keys are read from the macOS Keychain (shared with the Council app — macOS will ask
-once to allow access). Sessions land in the app's history unless --no-save.
+Keys are read from the macOS Keychain (shared with the Council app — macOS asks once
+per key, and again after a Council update rotates its Keychain items). Sessions land
+in the app's history unless --no-save.
 
 \(CouncilKit.attribution)
 """
@@ -79,6 +93,14 @@ func parseArgs(_ argv: [String]) -> Options {
                              o.filePath = args.removeFirst()
         case "--seats":      o.seatNames = (args.isEmpty ? "" : args.removeFirst())
                                  .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+        case "--guest":      guard !args.isEmpty else { die("--guest needs a path (see --help)", code: 64) }
+                             o.guestPath = args.removeFirst()
+        case "--guest-name": guard !args.isEmpty else { die("--guest-name needs a name", code: 64) }
+                             o.guestName = args.removeFirst()
+        case "--deliberate": o.deliberateNames = (args.isEmpty ? "" : args.removeFirst())
+                                 .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+        case "--chair":      guard !args.isEmpty else { die("--chair needs a provider (see --help)", code: 64) }
+                             o.chairName = args.removeFirst().lowercased()
         case "--json":       o.json = true
         case "--md":         o.md = true
         case "-o":           o.mdOut = args.isEmpty ? nil : args.removeFirst()
@@ -129,6 +151,14 @@ func keysSet(_ name: String) {
     let key = String(cString: raw).trimmingCharacters(in: .whitespacesAndNewlines)
     guard !key.isEmpty else { die("empty key") }
     do { try KeychainStore.save(key, account: p.keychainAccount) }
+    catch KeychainStore.KeychainError.staleItem {
+        // An updated build owns the old item name — hop to the next keychain generation
+        // (carrying every still-readable key) and retry once. Same path the app takes.
+        let all = LLMProvider.allCases.filter(\.requiresAPIKey).map(\.keychainAccount)
+        _ = KeychainStore.migrateToNextGeneration(accounts: all)
+        do { try KeychainStore.save(key, account: p.keychainAccount) }
+        catch { die("Keychain save failed: \(error)") }
+    }
     catch { die("Keychain save failed: \(error)") }
     print("saved to Keychain (account \(p.keychainAccount)) — shared with the Council app")
     exit(0)
@@ -185,6 +215,18 @@ func run(_ opts: Options) async {
         store.persistenceEnabled = wasPersistent
     }
 
+    // --chair is TRANSIENT, like --seats: moderate this run without persisting as the app's chair.
+    if let cname = opts.chairName {
+        guard let p = provider(named: cname) else { die("unknown provider '\(cname)' for --chair", code: 64) }
+        let wasPersistent = store.persistenceEnabled
+        store.persistenceEnabled = false
+        store.setChair(p)
+        store.persistenceEnabled = wasPersistent
+        if !store.isChairActive {
+            errPrint("warning: \(p.displayName) (chair) has no API key — an advisor will synthesize instead")
+        }
+    }
+
     let connected = store.seats.filter { store.hasKey($0) }
     guard !connected.isEmpty else {
         die("no seats configured — use --seats claude,gpt,gemini or --config lineup.council\n       (cloud providers also need: council keys set <provider>)", code: 64)
@@ -214,6 +256,21 @@ func run(_ opts: Options) async {
             errPrint(Style.dim("attached \(doc.count)-char document from stdin"))
         }
     }
+    // A pasted guest answer joins the round as one more anonymous position in blind review.
+    var guest: GuestAnswer?
+    if let path = opts.guestPath {
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else {
+            die("can't read --guest \(path)")
+        }
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { die("--guest \(path) is empty") }
+        if let err = CouncilLimits.guestError(text) { die(err) }
+        guest = GuestAnswer(name: opts.guestName, text: text)
+        errPrint(Style.dim("guest answer: \(text.count) chars — joins blind review anonymously"))
+    } else if opts.guestName != nil {
+        die("--guest-name needs --guest <path>", code: 64)
+    }
+
     // A document alone is a valid run — the engine synthesizes "Analyze the attached document."
     let question = opts.question
     guard !question.isEmpty || document != nil else { die("no question given (see --help)", code: 64) }
@@ -226,9 +283,12 @@ func run(_ opts: Options) async {
 
     // 1 — answers
     stage("answers (\(connected.count) seats)")
-    await store.ask(question, document: document)
+    await store.ask(question, document: document, guest: guest)
     let round = { () -> Round? in store.rounds.indices.contains(store.viewingRound) ? store.rounds[store.viewingRound] : nil }
-    guard let r0 = round(), !r0.answeredSeatIDs.isEmpty else {
+    // The guest sentinel is the USER's own pasted text, not an advisor answering: it must never
+    // make a round where every advisor failed look like a successful run (exit 0, guest echoed
+    // back as "the result"). Same predicate the engine's hasSession uses.
+    guard let r0 = round(), !r0.answeredSeatIDs.subtracting([Round.guestSeatID]).isEmpty else {
         let errs = store.seats.compactMap { seat -> String? in
             if case .failed(let m) = store.status[seat.id] ?? .idle { return "\(seat.provider?.panelName ?? "seat"): \(m)" }
             return nil
@@ -248,10 +308,37 @@ func run(_ opts: Options) async {
             let flat = a.replacingOccurrences(of: "\n", with: " ")
             print("  \(Style.bold(name(seat.id))): \(flat.count > 220 ? String(flat.prefix(220)) + "…" : flat)")
         }
+        if let g = round()?.guestAnswer {
+            let flat = g.replacingOccurrences(of: "\n", with: " ")
+            print("  \(Style.bold(round()?.guestName ?? "Guest")) (guest): \(flat.count > 220 ? String(flat.prefix(220)) + "…" : flat)")
+        }
         print("")
     }
 
+    // --deliberate: restrict which answers enter the pipeline (engine validates ≥2 + answered).
+    if let names = opts.deliberateNames {
+        var ids = Set<Int>()
+        for n in names {
+            if n == "guest" {
+                guard round()?.guestAnswer != nil else { die("--deliberate names 'guest' but no --guest was given", code: 64) }
+                ids.insert(Round.guestSeatID)
+            } else if let p = provider(named: n), let seat = store.seats.first(where: { $0.provider == p }) {
+                ids.insert(seat.id)
+            } else {
+                die("--deliberate: '\(n)' is not in the lineup", code: 64)
+            }
+        }
+        store.setDeliberationSelection(ids, forRound: store.viewingRound)
+        if round()?.includedSeatIDs == nil {
+            errPrint("warning: --deliberate not applied (needs ≥2 answered participants) — deliberating over everyone")
+        } else {
+            errPrint(Style.dim("deliberating over: \(names.joined(separator: ", "))"))
+        }
+    }
+
+    // ≥2 positions AND at least one real advisor to do the reviewing (a guest can't review).
     let canDeliberate = (round()?.answeredSeatIDs.count ?? 0) >= 2
+        && !((round()?.answeredSeatIDs.subtracting([Round.guestSeatID]).isEmpty) ?? true)
 
     // 2 — peer review
     if canDeliberate {
@@ -284,13 +371,17 @@ func run(_ opts: Options) async {
             emit(Style.dim("DIVERGENCE: verdict unavailable for this run") + "\n")
         }
 
-        // 4 — synthesis
+        // 4 — synthesis. --quiet prints it ONCE, bare, at the end (see the quiet block below):
+        // this header + body is the normal-output copy, and printing it here too made `--quiet`
+        // emit a "SYNTHESIS" header and the whole text twice.
         stage("synthesis")
         await store.runSynthesis()
-        if let s = store.synthesisText, !payloadMode {
+        if let s = store.synthesisText, !payloadMode, !opts.quiet {
             print(Style.bold("SYNTHESIS"))
             print(s + "\n")
         }
+        // The chair is optional and can fail; the run must say who actually wrote the analysis.
+        if let note = store.chairFallbackNote { errPrint("note: \(note)") }
 
         // 5 — dissent
         if let outlier = store.outlierName, let answer = store.outlierAnswer, !payloadMode, !opts.quiet {
@@ -332,6 +423,12 @@ func run(_ opts: Options) async {
             if let rv = r.peerReviews[seat.id], !rv.isEmpty { reviews[name(seat.id)] = rv }
             if let rb = r.rebuttals[seat.id], !rb.isEmpty { rebuttals[name(seat.id)] = rb }
         }
+        if let g = r.guestAnswer {
+            // A guest named after a real seat would collide as a dictionary key — disambiguate.
+            let gname = answers[r.guestName] == nil ? r.guestName : "\(r.guestName) (guest)"
+            seatsArr.append(["name": gname, "provider": "guest", "model": ""])
+            answers[gname] = g
+        }
         var obj: [String: Any] = [
             "schemaVersion": "council.cli.v1",
             // The round's question, not the raw arg: on the document-only path opts.question is empty
@@ -350,6 +447,14 @@ func run(_ opts: Options) async {
         }
         if let s = r.synthesis { obj["synthesis"] = s }
         if let o = r.outlier, let a = store.outlierAnswer { obj["dissent"] = ["name": o, "answer": a] }
+        if let inc = r.includedSeatIDs {
+            obj["deliberatedSeats"] = inc.sorted().map { $0 == Round.guestSeatID ? r.guestName : name($0) }
+        }
+        // Report the chair only when it actually authored something — a configured chair that
+        // couldn't run must not appear in machine output as if it had chaired.
+        if store.chairFallbackNote == nil, store.isChairActive, let cn = store.chairName { obj["chair"] = cn }
+        if let note = store.chairFallbackNote { obj["chairFallback"] = note }
+        if let c = r.chairSummary { obj["chairSummary"] = c }
         let data = try! JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
         print(String(data: data, encoding: .utf8)!)
     }

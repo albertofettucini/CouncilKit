@@ -20,6 +20,41 @@ public enum CouncilLimits {
         guard n > maxDocumentCharacters else { return nil }
         return "Document is \(n) characters — the limit is \(maxDocumentCharacters). Trim it or paste a smaller excerpt."
     }
+    /// Same cap for a pasted GUEST answer (it rides in every reviewer's context like a document).
+    public static func guestError(_ text: String) -> String? {
+        let n = text.count
+        guard n > maxDocumentCharacters else { return nil }
+        return "The guest answer is \(n) characters — the limit is \(maxDocumentCharacters). Trim it or paste the part that matters."
+    }
+
+    /// How long a seat may produce NOTHING before the council gives up on it and finishes the round
+    /// without it. This is a STALL limit, not a total-duration cap: a genuinely slow model that
+    /// keeps streaming is never cut off, however long it takes. It exists because one wedged
+    /// backend (a local server that accepted the connection and went quiet, a dead tunnel) used to
+    /// hold every other advisor's finished answer hostage indefinitely.
+    ///
+    /// The default is generous on purpose — a cold local model can take a while to load before its
+    /// first token — but it is settable for tighter environments (CI).
+    public static var stallTimeoutSeconds: Double = 90
+
+    /// How much of an attached document a round keeps so it can be re-asked identically. Sessions
+    /// are plain JSON on disk and every save re-encodes the whole thing, so a 100k-character
+    /// document in every round would make history heavy; past this size the round keeps only the
+    /// fact that there WAS an attachment and Regenerate stays disabled, as before.
+    public static let maxStoredAttachmentCharacters = 20_000
+}
+
+/// A pasted external answer (e.g. copied from ChatGPT or Gemini on the web) joining a round as an
+/// anonymous advisor: it is blind-reviewed by the real seats, counts in divergence/camps/outlier,
+/// and appears in synthesis/dissent — but it never generates anything itself. The optional `name`
+/// is shown only AFTER deliberation (the reviewing models never see it).
+public struct GuestAnswer: Sendable, Equatable {
+    public var name: String?
+    public var text: String
+    public init(name: String? = nil, text: String) {
+        self.name = name
+        self.text = text
+    }
 }
 
 /// Serializes the streaming pump's fire-and-forget UI flushes: at most ONE hop to the MainActor is
@@ -31,6 +66,33 @@ actor FlushGate {
     func tryEnter() -> Bool { if busy { return false }; busy = true; return true }
     func leave() { busy = false }
     func waitUntilIdle() async { while busy { await Task.yield() } }
+}
+
+/// Liveness clock for one streaming call, so a watchdog can tell "slow" from "hung": every chunk
+/// touches it, and the watchdog only fires when nothing has arrived for the stall limit.
+actor StreamLiveness {
+    private var last = DispatchTime.now().uptimeNanoseconds
+    private(set) var timedOut = false
+    func touch() { last = DispatchTime.now().uptimeNanoseconds }
+    func idleNanos() -> UInt64 { DispatchTime.now().uptimeNanoseconds &- last }
+    func markTimedOut() { timedOut = true }
+}
+
+/// What one stream attempt produced. Sendable, so the pump can run as its own task and be raced
+/// against the stall watchdog; failures are pre-classified because the raw `Error` is not Sendable
+/// and the caller only ever needed the classification.
+struct PumpOutcome: Sendable {
+    var text = ""
+    var input = 0
+    var output = 0
+    var failure: PumpFailure?
+}
+
+enum PumpFailure: Sendable {
+    case cancelled              // the user pressed Stop — keep whatever streamed, no error
+    case stalled(String)        // produced nothing for too long; do NOT retry a wedged backend
+    case transient(String)      // a connection blip — worth exactly one automatic retry
+    case permanent(String)
 }
 
 /// Central app state. A session is a list of `Round`s; each round keeps its own answers,
@@ -53,6 +115,7 @@ public final class CouncilStore {
     public var liveRebuttals: [Int: String] = [:]
     public var liveDivergence: String?
     public var liveSynthesis: String?
+    public var liveChairSummary: String?
     /// All rounds in the current session, oldest → newest.
     public var rounds: [Round] = []
     /// Which round the UI is showing (analyses + answers are read from this round).
@@ -72,6 +135,9 @@ public final class CouncilStore {
     /// permanent "analysis" saved to disk. Shown briefly in the canvas, cleared on retry/nav.
     public var divergenceError: String?
     public var synthesisError: String?
+    /// Same contract for the chair's post-debate summary: a failed call must be visible, not a
+    /// silently missing card after the UI promised "+1 chair summary".
+    public var chairError: String?
     /// Bumped whenever a key is saved; refreshes the key cache so views re-evaluate `hasKey`.
     public var keyRevision = 0 { didSet { refreshKeyCache() } }
     /// Cached set of providers that currently have a key — so `hasKey`/`keyExists` never hit the
@@ -174,10 +240,30 @@ public final class CouncilStore {
         didSet { guard persistenceEnabled else { return }; UserDefaults.standard.set(devilsAdvocateSeatID, forKey: Self.devilKey) }
     }
 
+    /// Optional NEUTRAL CHAIR: a fourth, out-of-band seat that runs divergence + verdict + synthesis
+    /// (and a short post-debate summary) but never answers the question — structural neutrality
+    /// instead of one advisor grading a debate it argued in. nil = an advisor synthesizes (the
+    /// default; behavior is byte-for-byte pre-chair). Persisted.
+    public var chairSeat: Seat? = nil {
+        didSet {
+            guard persistenceEnabled else { return }
+            if let c = chairSeat, let data = try? JSONEncoder().encode(c) {
+                UserDefaults.standard.set(data, forKey: Self.chairKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.chairKey)
+            }
+        }
+    }
+
+    /// The Council app's own bundle id — the one process allowed to turn off macOS Keychain dialogs
+    /// process-wide (see KeychainStore.suppressSystemPrompts).
+    static let appBundleID = "com.joseph.Council"
+
     private let seatsKey = "council.seats.v7"   // v7: ship default divergence personas
     private static let promptKey = "council.systemPrompt"
     private static let synthKey = "council.synthesizerSeat"
     private static let devilKey = "council.devilsAdvocate"
+    private static let chairKey = "council.chairSeat"
     public static let defaultSystemPrompt =
         "You are one of several AI advisors on a council. Answer the user's question directly, clearly, and concisely, in your own voice. Be honest; never flatter."
 
@@ -207,7 +293,7 @@ public final class CouncilStore {
     """
 
     private static let peerReviewPrompt = """
-    You are one of three AI advisors on a council and you have already given your own answer. \
+    You are one of several AI advisors on a council and you have already given your own answer. \
     Below are the other advisors' answers to the same question, anonymized. Review them critically: \
     state clearly where you AGREE and where you DISAGREE, and why. If one of them changed your mind, \
     say so and refine your view. If you still disagree, hold your ground and explain — do NOT cave to \
@@ -230,6 +316,26 @@ public final class CouncilStore {
     Be specific and concise. Do NOT pick a winner; just map the landscape honestly.
     """
 
+    /// Sentinel that separates the readable divergence map from its machine-readable verdict when
+    /// both come from one call. Chosen to be something no model would produce on its own, and
+    /// stripped from the text before it is ever shown or saved.
+    nonisolated static let verdictSentinel = "<<<COUNCIL_VERDICT>>>"
+
+    /// Divergence + verdict in ONE call, for backends that can be trusted to keep a strict tail
+    /// (see `LLMProvider.supportsMergedVerdict`). Same narrative contract as `divergencePrompt`,
+    /// plus the JSON `verdictPrompt` would otherwise ask for in a second pass over the same context.
+    private static let divergenceWithVerdictPrompt = """
+    You are the council's analyst. You are given the advisors' answers to a question. Map the \
+    deliberation in two clearly-headed markdown sections: "## Agreement" (points most or all advisors \
+    share) and "## Divergence" (where they disagree — name which advisor holds which view, and why). \
+    Be specific and concise. Do NOT pick a winner; just map the landscape honestly.
+
+    Then, after the markdown and NOTHING after it, output the line \(verdictSentinel) on its own, \
+    followed by a single JSON object and nothing else:
+    {"agreement": <integer 0-100, how much they agree on the bottom-line conclusion>, "camps": <integer number of distinct positions>, "outlier": <the single advisor label most apart, e.g. "Advisor B", or null>}
+    Agreement measures consensus, not correctness.
+    """
+
     /// Tiny structured-verdict prompt, run as a SEPARATE json-mode call (reliable even on small local
     /// models) so the score never depends on a free-form line the model might drop.
     private static let verdictPrompt = """
@@ -244,6 +350,15 @@ public final class CouncilStore {
     section "## Where they diverged" that explicitly preserves the dissent — note where advisors \
     disagreed and why, without flattening it into false consensus. The human decides: give them a \
     clear map, not a command.
+    """
+
+    private static let chairSummaryPrompt = """
+    You are the council's neutral chair. You did not answer the question yourself and you hold no \
+    position. Given the advisors' original answers and their final takes after debate, write a short \
+    neutral map of the debate in markdown: who moved and why, who held and why, and which single \
+    disagreement remains most load-bearing for the decision. Refer to advisors by the names used in \
+    the transcript. Do NOT pick a winner and do NOT add your own answer — you are the chair, not an \
+    advisor. Be concise.
     """
 
     public init() {
@@ -264,9 +379,25 @@ public final class CouncilStore {
         }
         if let n = UserDefaults.standard.object(forKey: Self.synthKey) as? Int { synthesizerSeatID = n }
         if let n = UserDefaults.standard.object(forKey: Self.devilKey) as? Int { devilsAdvocateSeatID = n }
+        if let data = UserDefaults.standard.data(forKey: Self.chairKey),
+           let c = try? JSONDecoder().decode(Seat.self, from: data), c.id == Seat.chairID {
+            chairSeat = c
+        }
         // Only the APP warms the key cache (it shows all providers' status). A bare CLI process
         // doing this would hit the Keychain for every provider at launch — a wall of permission
         // prompts. The CLI reads lazily, only for seats it actually uses (see keyExists).
+        //
+        // Suppress system Keychain dialogs FIRST: this warm-up is the process's earliest read, so
+        // after an update (ad-hoc signing ⇒ new code identity ⇒ the previous build's items are
+        // foreign) it is exactly where macOS would otherwise stack a password dialog per provider,
+        // long before the app's own re-enter sheet gets a chance. Suppressed, those reads fail
+        // silently and `staleKeychainProviders()` turns them into ONE calm prompt.
+        // Gated on Council itself, not merely "has a bundle id": suppressing the system's Keychain
+        // dialogs is process-wide and permanent, so a THIRD-PARTY app embedding CouncilKit must
+        // never have it done to it as a side effect of constructing the engine.
+        if Bundle.main.bundleIdentifier == Self.appBundleID {
+            KeychainStore.suppressSystemPrompts()
+        }
         if Bundle.main.bundleIdentifier != nil { refreshKeyCache() }
         loadSessions()
     }
@@ -291,11 +422,16 @@ public final class CouncilStore {
         }
         let synthIdx = seats.firstIndex { $0.id == synthesizerSeatID }
         let devilIdx = seats.firstIndex { $0.id == devilsAdvocateSeatID }
+        let chairConfig = chairSeat.map { c in
+            CouncilConfig.SeatConfig(provider: c.provider, model: c.model,
+                                     systemPrompt: nil, temperature: nil, maxTokens: nil)
+        }
         return CouncilConfig(name: name.isEmpty ? "My council" : name,
                              seats: seatConfigs,
                              sharedSystemPrompt: sharedSystemPrompt,
                              synthesizerSeatIndex: synthIdx,
-                             devilsAdvocateSeatIndex: devilIdx)
+                             devilsAdvocateSeatIndex: devilIdx,
+                             chair: chairConfig)
     }
 
     /// Apply a shared/preset config to the live seats. Keeps existing seat ids, maps each
@@ -324,6 +460,12 @@ public final class CouncilStore {
         if let s = config.synthesizerSeatIndex, seats.indices.contains(s) { synthesizerSeatID = seats[s].id }
         if let d = config.devilsAdvocateSeatIndex, seats.indices.contains(d) { devilsAdvocateSeatID = seats[d].id }
         else { devilsAdvocateSeatID = -1 }
+        // A config that carries a chair sets one. A config that DOESN'T (every pre-1.2 file, and
+        // all four bundled presets) leaves the user's chair alone — silently unseating a paid
+        // moderator because a shared lineup predates the feature is a change nobody asked for.
+        if let cc = config.chair, let p = cc.provider {
+            setChair(p, model: cc.model.isEmpty ? nil : cc.model)
+        }
         saveSeats()
         keyRevision += 1
     }
@@ -360,6 +502,13 @@ public final class CouncilStore {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         do { try KeychainStore.save(trimmed, account: provider.keychainAccount) }
+        catch KeychainStore.KeychainError.staleItem {
+            // A previous build's orphaned item owns this name (post-update state) — adopt the next
+            // generation (carrying every still-readable key with it) and retry once.
+            _ = KeychainStore.migrateToNextGeneration(accounts:
+                LLMProvider.allCases.filter(\.requiresAPIKey).map(\.keychainAccount))
+            guard (try? KeychainStore.save(trimmed, account: provider.keychainAccount)) != nil else { return false }
+        }
         catch { return false }
         keyRevision += 1
         return true
@@ -368,6 +517,23 @@ public final class CouncilStore {
     public func clearKey(for provider: LLMProvider) {
         KeychainStore.delete(account: provider.keychainAccount)
         keyRevision += 1
+    }
+
+    /// Launch-time staleness check for the app. Ad-hoc signing means every shipped build is a
+    /// different code identity to macOS, so after a Sparkle update the old build's keychain items
+    /// answer only to password prompts — and can be neither read, deleted, nor re-created under
+    /// the same name. This probes silently (NO dialogs) and returns the providers whose keys this
+    /// build can't use, so the app shows ONE calm re-enter sheet instead of a prompt storm.
+    ///
+    /// DETECTION ONLY — deliberately no generation bump here. The bump happens lazily inside
+    /// setKey (KeychainError.staleItem → migrate + retry) the moment the user actually re-enters a
+    /// key. A launch-time bump would let any side-by-side build (a dev ⌘R next to the installed
+    /// release) silently shift the SHARED generation and orphan the other build's readable keys.
+    public func staleKeychainProviders() -> [LLMProvider] {
+        let keyed = LLMProvider.allCases.filter(\.requiresAPIKey)
+        let stale = KeychainStore.staleAccounts(keyed.map(\.keychainAccount))
+        guard !stale.isEmpty else { return [] }
+        return keyed.filter { stale.contains($0.keychainAccount) }
     }
 
     public func validateAndSaveKey(_ key: String, for seat: Seat) async -> String? {
@@ -412,6 +578,39 @@ public final class CouncilStore {
         seats.contains { $0.id != seatID && $0.provider == provider }
     }
 
+    // MARK: - Neutral chair
+
+    /// Configure (or clear, with nil) the neutral chair. The chair reuses the normal provider/key
+    /// machinery via a reserved out-of-band Seat, so keys come from the same Keychain accounts.
+    public func setChair(_ provider: LLMProvider?, model: String? = nil) {
+        guard let provider else { chairSeat = nil; keyRevision += 1; return }
+        chairSeat = Seat(id: Seat.chairID, archetype: .sage, provider: provider, model: model)
+        keyRevision += 1
+    }
+
+    public func setChairModel(_ model: String) {
+        guard var c = chairSeat else { return }
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        c.model = trimmed.isEmpty ? (c.provider?.defaultModel ?? "") : trimmed
+        chairSeat = c
+    }
+
+    /// True when a chair is configured and looks runnable (its provider is connected). "Connected"
+    /// is all the app can know up front for key-free backends (Ollama, a custom endpoint): the call
+    /// itself is the only real proof, so `chairFallbackNote` reports after the fact when a chair
+    /// turned out not to work and an advisor stood in.
+    public var isChairActive: Bool { chairSeat.map(hasKey) ?? false }
+    public var chairName: String? { chairSeat?.provider?.panelName }
+    /// Set when a configured chair failed and an advisor authored the stage instead — the UI shows
+    /// the actual author, never the intended one.
+    public var chairFallbackNote: String?
+
+    /// The advisor that authors deliberation when there is no usable chair.
+    private var advisorSynthesizerSeat: Seat? {
+        if let chosen = seats.first(where: { $0.id == synthesizerSeatID }), hasKey(chosen) { return chosen }
+        return seats.first { hasKey($0) }
+    }
+
     /// Per-seat sampling override. Passing nil clears it (falls back to provider default).
     public func setTemperature(_ value: Double?, seatID: Int) {
         guard let idx = seats.firstIndex(where: { $0.id == seatID }) else { return }
@@ -437,13 +636,18 @@ public final class CouncilStore {
     public func nextRound() { if canGoNextRound { viewingRound += 1; clearDeliberationErrors() } }
 
     /// Drop the transient divergence/synthesis errors (they belong to one attempt on one round).
-    public func clearDeliberationErrors() { divergenceError = nil; synthesisError = nil }
+    public func clearDeliberationErrors() { divergenceError = nil; synthesisError = nil; chairError = nil }
 
     private var viewedRound: Round? { rounds.indices.contains(viewingRound) ? rounds[viewingRound] : nil }
     public var viewedQuestion: String { viewedRound?.question ?? "" }
     /// True if the viewed round carried an attachment — the UI uses it to disable per-seat Regenerate
     /// (which can't reproduce an answer built from an image/document Council doesn't persist).
-    public var viewedRoundHadAttachment: Bool { viewedRound?.hadAttachment ?? false }
+    /// True only when the viewed round's attachment can't be reproduced — the case that still has
+    /// to disable Regenerate. A round whose document we kept is regenerable like any other.
+    public var viewedRoundHadAttachment: Bool {
+        guard let r = viewedRound else { return false }
+        return r.hadAttachment && r.attachedDocument == nil
+    }
     public func viewedAnswer(_ seatID: Int) -> String? {
         // While this seat is streaming into the viewed (generating) round, read the live buffer.
         if generatingRound == viewingRound, let live = liveAnswers[seatID] { return live }
@@ -460,6 +664,28 @@ public final class CouncilStore {
     /// Read-only views of the current round's cross-model artifacts (used by the UI).
     public var divergenceText: String? { liveDivergence ?? viewedRound?.divergence }
     public var synthesisText: String? { liveSynthesis ?? viewedRound?.synthesis }
+    /// Gated on the generating round (unlike the older divergence/synthesis readers): the chair
+    /// summary streams AFTER the debate, by which time the user may well have navigated away —
+    /// its partial text must not appear under a different round's debate.
+    public var chairSummaryText: String? {
+        if generatingRound == viewingRound, let live = liveChairSummary { return live }
+        return viewedRound?.chairSummary
+    }
+    /// Who chaired the VIEWED round — the recorded author, not whatever Settings says today.
+    public var viewedChairName: String? { viewedRound?.chairProvider ?? chairName }
+    /// The viewed round's pasted guest answer, if any — the UI reads these instead of touching the
+    /// reserved sentinel id.
+    public var viewedGuestAnswer: String? { viewedRound?.guestAnswer }
+    public var viewedGuestName: String { viewedRound?.guestName ?? "Guest" }
+    /// Ids that actually deliberate in a round — the single source of truth the UI must ask, so a
+    /// seat the engine drops (missing key) is reported exactly like one the user excluded, instead
+    /// of being shown as participating.
+    public func participantIDs(in idx: Int) -> Set<Int> { Set(participants(in: idx).map(\.id)) }
+    /// Same, for the round on screen.
+    public var viewedParticipantIDs: Set<Int> { participantIDs(in: viewingRound) }
+
+    /// Whether this seat's answer participates in the viewed round's deliberation (false = SAT OUT).
+    public func isSeatDeliberating(_ seatID: Int) -> Bool { viewedParticipantIDs.contains(seatID) }
     /// The verdict's AGREEMENT score (0–100). Named honestly — the UI shows 100 − this as divergence.
     public var agreementScore: Int? { viewedRound?.divergenceScore }
     public var divergenceCamps: Int? { viewedRound?.divergenceCamps }
@@ -493,7 +719,13 @@ public final class CouncilStore {
         for s in sessions {
             all += s.totalCostUSD
             if cal.isDate(s.updatedAt, equalTo: now, toGranularity: .month) { month += s.totalCostUSD }
-            for r in s.rounds { for name in r.answerProviders.values { counts[name, default: 0] += 1 } }
+            // Skip the guest sentinel: a pasted answer's label ("Guest", "ChatGPT"…) isn't a model
+            // the user runs, and must never surface as the dashboard's "top model".
+            for r in s.rounds {
+                for (sid, name) in r.answerProviders where sid != Round.guestSeatID {
+                    counts[name, default: 0] += 1
+                }
+            }
         }
         allTimeCostUSD = all; thisMonthCostUSD = month
         topModelName = counts.max { $0.value < $1.value }?.key
@@ -552,20 +784,54 @@ public final class CouncilStore {
         }
     }
 
-    private func answeredSeats(in idx: Int) -> [Seat] {
-        guard rounds.indices.contains(idx) else { return [] }
-        return seats.filter { hasKey($0) && !((rounds[idx].answers[$0.id] ?? "").isEmpty) }
+    /// One entry in a round's blind deliberation set: a real seat's answer, or the pasted guest
+    /// answer. `seat == nil` = the guest — reviewed and analyzed like any advisor, but it never
+    /// calls a model (no reviews BY it, no rebuttal FROM it).
+    private struct Participant {
+        let id: Int
+        let name: String
+        let answer: String
+        let seat: Seat?
     }
+
+    /// The full blind set for a round's deliberation: answered keyed seats plus the guest answer,
+    /// filtered by the round's `includedSeatIDs` selection (nil = everyone deliberates).
+    private func participants(in idx: Int) -> [Participant] {
+        guard rounds.indices.contains(idx) else { return [] }
+        let round = rounds[idx]
+        let included = round.includedSeatIDs.map(Set.init)
+        var out: [Participant] = []
+        for seat in seats {
+            guard hasKey(seat), let a = round.answers[seat.id], !a.isEmpty else { continue }
+            if let inc = included, !inc.contains(seat.id) { continue }
+            out.append(Participant(id: seat.id, name: seat.provider?.panelName ?? "Advisor",
+                                   answer: a, seat: seat))
+        }
+        if let g = round.guestAnswer, included?.contains(Round.guestSeatID) ?? true {
+            out.append(Participant(id: Round.guestSeatID, name: round.guestName, answer: g, seat: nil))
+        }
+        return out
+    }
+
+    /// The real seats that both deliberate AND can call a model — the reviewers/rebutters.
+    private func deliberatingSeats(in idx: Int) -> [Seat] { participants(in: idx).compactMap(\.seat) }
+
     private var anyLoading: Bool { status.values.contains { $0 == .loading } || deliberationBusy }
     /// True while any advisor or a deliberation round is generating. The UI uses this to lock
     /// session switching so an in-flight write can't land in a session swapped out underneath it.
     public var isWorking: Bool { anyLoading }
-    /// The chosen synthesizer seat if it has a key; otherwise the first connected seat.
+    /// Who authors divergence/verdict/synthesis: a connected neutral chair wins; else the chosen
+    /// synthesizer seat if keyed; else the first connected seat.
     private var synthesizerSeat: Seat? {
-        if let chosen = seats.first(where: { $0.id == synthesizerSeatID }), hasKey(chosen) { return chosen }
-        return seats.first { hasKey($0) }
+        if let chair = chairSeat, hasKey(chair) { return chair }
+        return advisorSynthesizerSeat
     }
-    private func canDeliberate(_ idx: Int) -> Bool { answeredSeats(in: idx).count >= 2 && !anyLoading }
+    /// Deliberation needs ≥2 positions on the table and ≥1 real seat to do the reviewing —
+    /// "1 real advisor + the guest" is the minimum council (pressure-test a pasted answer).
+    private func canDeliberate(_ idx: Int) -> Bool {
+        let all = participants(in: idx)
+        return all.count >= 2 && all.contains { $0.seat != nil } && !anyLoading
+    }
 
     /// Peer review / divergence / synthesis operate on the round you're viewing.
     public var canPeerReview: Bool { canDeliberate(viewingRound) }
@@ -587,7 +853,91 @@ public final class CouncilStore {
         return r
     }
     public var synthesizerName: String? { synthesizerSeat?.provider?.panelName }
-    public var hasSession: Bool { rounds.contains { !$0.answeredSeatIDs.isEmpty } }
+    /// A session exists once a REAL advisor has answered — a guest-only round (every seat failed)
+    /// is not a council and must not persist as one.
+    public var hasSession: Bool {
+        rounds.contains { !$0.answeredSeatIDs.subtracting([Round.guestSeatID]).isEmpty }
+    }
+
+    // MARK: - Selective deliberation
+
+    /// Choose which answers (by seat id, `Round.guestSeatID` included) enter this round's
+    /// deliberation. nil = everyone (the default). Rejects selections smaller than 2 or naming
+    /// seats that didn't answer. If the round already deliberated, its artifacts are cleared —
+    /// same "nothing stale survives" rule as regenerate.
+    public func setDeliberationSelection(_ ids: Set<Int>?, forRound idx: Int) {
+        guard rounds.indices.contains(idx), !anyLoading else { return }
+        if let ids {
+            guard ids.count >= 2, ids.isSubset(of: rounds[idx].answeredSeatIDs) else { return }
+        }
+        let current = rounds[idx].includedSeatIDs.map(Set.init)
+        guard current != ids else { return }
+        if roundHasDeliberation(idx) { invalidateDeliberation(idx) }
+        rounds[idx].includedSeatIDs = ids.map { Array($0).sorted() }
+        saveConversation()
+    }
+
+    private func roundHasDeliberation(_ idx: Int) -> Bool {
+        guard rounds.indices.contains(idx) else { return false }
+        let r = rounds[idx]
+        return r.peerReviews.values.contains(where: { !$0.isEmpty })
+            || r.divergence != nil || r.synthesis != nil
+            || r.rebuttals.values.contains(where: { !$0.isEmpty })
+            || r.chairSummary != nil
+    }
+
+    /// Clear every deliberation artifact on a round — peer reviews, the rebuttal round, divergence +
+    /// verdict, synthesis, and the chair's summary. Used when an input to deliberation changes
+    /// (regenerate, a new guest, a changed selection) so nothing stale survives next to new inputs.
+    private func invalidateDeliberation(_ idx: Int) {
+        guard rounds.indices.contains(idx) else { return }
+        rounds[idx].peerReviews.removeAll()
+        rounds[idx].rebuttals.removeAll()
+        rounds[idx].divergence = nil
+        rounds[idx].divergenceScore = nil; rounds[idx].divergenceCamps = nil
+        rounds[idx].outlier = nil; rounds[idx].outlierSeatID = nil
+        rounds[idx].synthesis = nil
+        rounds[idx].chairSummary = nil
+        rounds[idx].chairProvider = nil
+        divergenceError = nil; synthesisError = nil; chairError = nil
+    }
+
+    // MARK: - Guest seat
+
+    /// Paste an external answer into the LATEST round after the fact. Deliberation artifacts (if
+    /// any) are invalidated — the blind set changed — and any selection resets to "everyone".
+    public func addGuestAnswer(_ text: String, name: String? = nil) {
+        let idx = rounds.count - 1
+        guard rounds.indices.contains(idx), !anyLoading else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, CouncilLimits.guestError(trimmed) == nil else { return }
+        if roundHasDeliberation(idx) { invalidateDeliberation(idx) }
+        rounds[idx].includedSeatIDs = nil
+        rounds[idx].answers[Round.guestSeatID] = trimmed
+        rounds[idx].answerProviders[Round.guestSeatID] = Self.guestDisplayName(name)
+        saveConversation()
+    }
+
+    /// Remove the latest round's guest answer (and, since the blind set changed, its deliberation).
+    public func removeGuestAnswer() {
+        let idx = rounds.count - 1
+        guard rounds.indices.contains(idx), !anyLoading, rounds[idx].guestAnswer != nil else { return }
+        if roundHasDeliberation(idx) { invalidateDeliberation(idx) }
+        rounds[idx].includedSeatIDs = nil
+        rounds[idx].answers[Round.guestSeatID] = nil
+        rounds[idx].answerProviders[Round.guestSeatID] = nil
+        saveConversation()
+    }
+
+    private static func guestDisplayName(_ raw: String?) -> String {
+        let t = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !t.isEmpty else { return "Guest" }
+        // A guest literally named "Advisor C" would collide with the blind labels themselves.
+        if t.range(of: "^Advisor\\s+[A-Z]$", options: [.regularExpression, .caseInsensitive]) != nil {
+            return "Guest"
+        }
+        return String(t.prefix(24))
+    }
 
     // MARK: - Rounds
 
@@ -597,7 +947,8 @@ public final class CouncilStore {
     /// "pressure-test this AI output with other models" use case. Like an image, the document rides
     /// on the request only: history + the saved round keep just the typed question, so a big doc
     /// never bloats the sidebar or follow-up context.
-    public func ask(_ query: String, image: ImageAttachment? = nil, document: String? = nil) async {
+    public func ask(_ query: String, image: ImageAttachment? = nil, document: String? = nil,
+                    guest: GuestAnswer? = nil) async {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         // Defend the public API: a whitespace-only document is no document, regardless of caller hygiene.
         let trimmedDoc = document?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -613,6 +964,20 @@ public final class CouncilStore {
         guard !keyed.isEmpty else { return }
         var round = Round(question: question)
         round.hadAttachment = (image != nil || doc != nil)   // see Round.hadAttachment — gates Regenerate
+        // Keep a modest document so Regenerate can re-ask the SAME question later. An image is
+        // never kept (size), so an image round still can't be regenerated.
+        if image == nil, let doc, doc.count <= CouncilLimits.maxStoredAttachmentCharacters {
+            round.attachedDocument = doc
+        }
+        // A staged guest answer joins the round as one more (static) position. The advisors never
+        // see it in THEIR answer prompts — it enters only the blind deliberation set.
+        if let g = guest {
+            let gTrim = g.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !gTrim.isEmpty, CouncilLimits.guestError(gTrim) == nil {
+                round.answers[Round.guestSeatID] = gTrim
+                round.answerProviders[Round.guestSeatID] = Self.guestDisplayName(g.name)
+            }
+        }
         for seat in keyed { round.answers[seat.id] = "" }   // in-progress slots
         rounds.append(round)
         let idx = rounds.count - 1
@@ -639,30 +1004,35 @@ public final class CouncilStore {
         saveConversation()
     }
 
-    /// Round 2: each advisor reviews the others' answers (anonymized) for the VIEWED round.
+    /// Round 2: each advisor reviews the other POSITIONS (anonymized) for the VIEWED round. The
+    /// blind set may include a pasted guest answer — it gets an Advisor label like everyone else,
+    /// so reviewers can't tell it's pasted; the guest itself never reviews (it can't call a model).
     public func peerReview() async {
         let idx = viewingRound
-        let answered = answeredSeats(in: idx)
-        guard answered.count >= 2, rounds.indices.contains(idx) else { return }
-        let pairs = answered.map { (seat: $0, answer: rounds[idx].answers[$0.id] ?? "") }
-        let names = uniqueNames(for: answered)
+        let all = participants(in: idx)
+        let reviewers = all.compactMap(\.seat)
+        guard all.count >= 2, !reviewers.isEmpty, rounds.indices.contains(idx) else { return }
+        let names = uniqueNames(for: all.map { (id: $0.id, base: $0.name) })
         deliberationBusy = true
         generatingRound = idx
         pipelineStage = "Peer review"
-        for s in answered { status[s.id] = .loading; rounds[idx].peerReviews[s.id] = "" }
-        // Re-running peer review invalidates the rebuttal round that followed the OLD reviews —
-        // clear it so DEBATE unlocks again instead of showing a stale final take.
+        for s in reviewers { status[s.id] = .loading; rounds[idx].peerReviews[s.id] = "" }
+        // Re-running peer review invalidates the rebuttal round (and any chair summary of it) that
+        // followed the OLD reviews — clear them so DEBATE unlocks again instead of showing stale takes.
         rounds[idx].rebuttals.removeAll()
+        rounds[idx].chairSummary = nil
 
         await withTaskGroup(of: Void.self) { group in
-            for (seat, myAnswer) in pairs {
-                let others = pairs.filter { $0.seat.id != seat.id }
+            for seat in reviewers {
+                let myAnswer = rounds[idx].answers[seat.id] ?? ""
                 // Blind the reviewer with anonymous labels (no brand bias), but keep a map back
                 // to real names so the READER sees "I disagree with Gemini", not "Advisor B".
+                // Shuffled per reviewer so no position (e.g. the guest) sits at a fixed letter.
+                let others = all.filter { $0.id != seat.id }.shuffled()
                 var remap: [String: String] = [:]
                 let othersText = others.enumerated().map { i, p -> String in
                     let label = "Advisor \(String(UnicodeScalar(65 + i)!))"
-                    remap[label] = names[p.seat.id] ?? "Advisor"
+                    remap[label] = names[p.id] ?? "Advisor"
                     return "\(label) said:\n\(p.answer)"
                 }.joined(separator: "\n\n")
                 let reviewText = """
@@ -709,26 +1079,29 @@ public final class CouncilStore {
     /// briefly saying why. Hard-capped at a single round per round so cost can't run away.
     public func runRebuttal() async {
         let idx = viewingRound
-        let answered = answeredSeats(in: idx)
-        guard answered.count >= 2, rounds.indices.contains(idx), !hasRebuttalForViewedRound else { return }
+        let all = participants(in: idx)
+        let rebutters = all.compactMap(\.seat)
+        guard all.count >= 2, !rebutters.isEmpty, rounds.indices.contains(idx),
+              !hasRebuttalForViewedRound else { return }
         deliberationBusy = true
         generatingRound = idx
         pipelineStage = "Debate"
-        for s in answered { status[s.id] = .loading; rounds[idx].rebuttals[s.id] = "" }
-        let pairs = answered.map { (seat: $0, answer: rounds[idx].answers[$0.id] ?? "") }
-        let names = uniqueNames(for: answered)
+        for s in rebutters { status[s.id] = .loading; rounds[idx].rebuttals[s.id] = "" }
+        let names = uniqueNames(for: all.map { (id: $0.id, base: $0.name) })
 
         await withTaskGroup(of: Void.self) { group in
-            for seat in answered {
+            for seat in rebutters {
                 let myAnswer = rounds[idx].answers[seat.id] ?? ""
-                // Anonymize only the OTHER advisors (like peer review). Including the seat's own
+                // Anonymize only the OTHER positions (like peer review) — the guest's answer is in
+                // the blind set too, but the guest itself never rebuts (it's a static paste, and a
+                // fabricated "I hold my position" line would be dishonest). Including the seat's own
                 // answer in the blind set makes it read its own position as a stranger's — and after
                 // de-anonymization it ends up "agreeing with itself" by name on screen.
-                let others = pairs.filter { $0.seat.id != seat.id }
+                let others = all.filter { $0.id != seat.id }.shuffled()
                 var remap: [String: String] = [:]
                 let ctx = others.enumerated().map { i, p -> String in
                     let label = "Advisor \(String(UnicodeScalar(65 + i)!))"
-                    remap[label] = names[p.seat.id] ?? "Advisor"
+                    remap[label] = names[p.id] ?? "Advisor"
                     return "\(label):\n\(p.answer)"
                 }.joined(separator: "\n\n")
                 let prompt = """
@@ -773,6 +1146,67 @@ public final class CouncilStore {
         generatingRound = nil
         pipelineStage = nil
         saveConversation()
+        // A configured chair closes the debate with its neutral summary — one extra call, disclosed
+        // in the UI's cost note. Runs only when the rebuttal actually produced final takes. Pass the
+        // round explicitly: round navigation isn't locked during a run, so re-reading viewingRound
+        // here could attach this summary to a round that never had the debate.
+        if !Task.isCancelled, isChairActive,
+           rounds[idx].rebuttals.values.contains(where: { !$0.isEmpty }) {
+            await runChairSummary(round: idx)
+        }
+    }
+
+    /// The chair's post-debate wrap-up: a short, neutral map of who moved and who held. Chair-only
+    /// (never an advisor — an advisor summarizing a debate it argued in isn't neutral). Reads the
+    /// de-anonymized transcript: rebuttals are stored with real names restored, and re-blinding
+    /// them by string surgery would garble content, so the chair sees names — acceptable for a
+    /// SUMMARY of an already-public transcript, unlike divergence/synthesis which stay blind.
+    /// `round` defaults to the viewed round (a manual re-run); the debate pipeline passes its own
+    /// index so a mid-run round change can't misfile the summary.
+    public func runChairSummary(round idx: Int? = nil) async {
+        let idx = idx ?? viewingRound
+        guard let chair = chairSeat, hasKey(chair), rounds.indices.contains(idx),
+              rounds[idx].rebuttals.values.contains(where: { !$0.isEmpty }) else { return }
+        deliberationBusy = true
+        generatingRound = idx   // the live buffer belongs to THIS round (see chairSummaryText)
+        pipelineStage = "Chair summary"
+        chairError = nil
+        let round = rounds[idx]
+        func displayName(_ id: Int) -> String {
+            round.answerProviders[id] ?? seats.first { $0.id == id }?.provider?.panelName ?? "Advisor"
+        }
+        var blocks: [String] = []
+        for p in participants(in: idx) {
+            var b = "\(displayName(p.id)) first said:\n\(p.answer)"
+            if let reb = round.rebuttals[p.id], !reb.isEmpty {
+                b += "\n\n\(displayName(p.id))'s final take after debate:\n\(reb)"
+            } else {
+                // Never let silence read as "held its position": the guest is a static paste and a
+                // seat may simply have failed. Say which it is, and the prompt forbids guessing.
+                b += "\n\n\(displayName(p.id)) did not take part in the debate round, so it has no final take."
+            }
+            blocks.append(b)
+        }
+        let user = "The council was asked:\n\(round.question)\n\nThe debate:\n\n\(blocks.joined(separator: "\n\n---\n\n"))"
+        let r = await streamCall(seat: chair, messages: [.system(Self.chairSummaryPrompt), .user(user)]) { partial in
+            self.liveChairSummary = partial   // raw buffer — no rounds churn per tick
+        }
+        liveChairSummary = nil
+        if rounds.indices.contains(idx) {
+            if let t = r.text, !r.cancelled {
+                rounds[idx].chairSummary = t
+                // Record WHO chaired: the Settings chair can change later, and a summary must keep
+                // naming the model that actually wrote it.
+                rounds[idx].chairProvider = chair.provider?.panelName
+                addRoundUsage(idx, chair, r)
+            } else if !r.cancelled {
+                chairError = r.error ?? "The chair couldn't write its summary."
+            }
+        }
+        deliberationBusy = false
+        generatingRound = nil
+        pipelineStage = nil
+        saveConversation()
     }
 
     /// The single-page flow: once a round's answers are in, the deliberation stages run
@@ -780,7 +1214,7 @@ public final class CouncilStore {
     /// safe to call after a regenerate too. Cancellation (Stop) exits between stages.
     public func runAutoPipeline() async {
         let idx = viewingRound
-        guard rounds.indices.contains(idx), answeredSeats(in: idx).count >= 2 else { return }
+        guard rounds.indices.contains(idx), canDeliberate(idx) else { return }
         if !hasPeerReviewForViewedRound, !Task.isCancelled {
             pipelineStage = "Peer review"
             await peerReview()
@@ -796,9 +1230,31 @@ public final class CouncilStore {
         pipelineStage = nil
     }
 
+    /// Run a deliberation call, and if a configured CHAIR is the one that failed, stand an advisor
+    /// up instead rather than leaving the round with nothing. Whether a key-free chair (Ollama, a
+    /// custom endpoint, a model that isn't pulled) can actually answer is only knowable by calling
+    /// it — so the honest design is to try, then fall back and SAY SO (`chairFallbackNote`).
+    private func runAuthored(
+        _ messages: [ChatMessage],
+        onDelta: @MainActor @escaping (String) -> Void
+    ) async -> (seat: Seat, result: StreamResult)? {
+        guard let first = synthesizerSeat else { return nil }
+        let r = await streamCall(seat: first, messages: messages, onDelta: onDelta)
+        let chairFailed = (first.id == Seat.chairID) && r.text == nil && !r.cancelled
+        guard chairFailed, let advisor = advisorSynthesizerSeat else {
+            if first.id != Seat.chairID { chairFallbackNote = nil }
+            return (first, r)
+        }
+        let retry = await streamCall(seat: advisor, messages: messages, onDelta: onDelta)
+        chairFallbackNote = retry.text != nil
+            ? "\(first.provider?.panelName ?? "The chair") couldn't run — \(advisor.provider?.panelName ?? "an advisor") wrote this."
+            : nil
+        return (advisor, retry)
+    }
+
     public func runDivergence() async {
         let idx = viewingRound
-        guard canDeliberate(idx), let seat = synthesizerSeat, rounds.indices.contains(idx) else { return }
+        guard canDeliberate(idx), rounds.indices.contains(idx) else { return }
         deliberationBusy = true
         pipelineStage = "Divergence"
         divergenceError = nil
@@ -806,14 +1262,24 @@ public final class CouncilStore {
         // and the stream replaces it from the first token on success.
         let (ctx, remap, seatByLabel) = anonymizedContext(idx)
         let user = "Question:\n\(rounds[idx].question)\n\nThe advisors' answers (anonymized):\n\n\(ctx)"
-        let r = await streamCall(seat: seat, messages: [.system(Self.divergencePrompt), .user(user)]) { partial in
-            self.liveDivergence = partial   // raw buffer — no rounds churn per tick
+        // Capable backends return the map AND its verdict together, halving this stage's calls.
+        let merged = synthesizerSeat?.provider?.supportsMergedVerdict ?? false
+        let prompt = merged ? Self.divergenceWithVerdictPrompt : Self.divergencePrompt
+        let authored = await runAuthored([.system(prompt), .user(user)]) { partial in
+            // Never let the machine-readable tail flash on screen mid-stream.
+            self.liveDivergence = Self.narrativePart(partial)
         }
         liveDivergence = nil   // a failed/cancelled regen falls back to the prior committed text
-        if rounds.indices.contains(idx) {
+        if let (seat, r) = authored, rounds.indices.contains(idx) {
             if let t = r.text, !r.cancelled {
-                rounds[idx].divergence = deAnonymize(t, remap); addRoundUsage(idx, seat, r)
-                await computeVerdict(seat: seat, idx: idx, user: user, remap: remap, seatByLabel: seatByLabel)
+                rounds[idx].divergence = deAnonymize(Self.narrativePart(t), remap)
+                addRoundUsage(idx, seat, r)
+                // Use the merged verdict when it parsed; otherwise fall back to the separate judge
+                // call, so a backend that ignored the tail costs exactly what it costs today.
+                if !(merged && applyVerdict(Self.parseVerdictJSON(Self.verdictPart(t) ?? ""),
+                                            idx: idx, remap: remap, seatByLabel: seatByLabel)) {
+                    await computeVerdict(seat: seat, idx: idx, user: user, remap: remap, seatByLabel: seatByLabel)
+                }
             }
             else if !r.cancelled { divergenceError = r.error ?? "Failed" }   // transient, never persisted as content
         }
@@ -824,17 +1290,17 @@ public final class CouncilStore {
 
     public func runSynthesis() async {
         let idx = viewingRound
-        guard canDeliberate(idx), let seat = synthesizerSeat, rounds.indices.contains(idx) else { return }
+        guard canDeliberate(idx), rounds.indices.contains(idx) else { return }
         deliberationBusy = true
         pipelineStage = "Synthesis"
         synthesisError = nil
         let (ctx, remap, _) = anonymizedContext(idx)
         let context = "Question:\n\(rounds[idx].question)\n\nThe advisors' answers (anonymized):\n\n\(ctx)"
-        let r = await streamCall(seat: seat, messages: [.system(Self.synthesisPrompt), .user(context)]) { partial in
+        let authored = await runAuthored([.system(Self.synthesisPrompt), .user(context)]) { partial in
             self.liveSynthesis = partial   // raw buffer — no rounds churn per tick
         }
         liveSynthesis = nil   // a failed/cancelled regen falls back to the prior committed text
-        if rounds.indices.contains(idx) {
+        if let (seat, r) = authored, rounds.indices.contains(idx) {
             if let t = r.text, !r.cancelled { rounds[idx].synthesis = deAnonymize(t, remap); addRoundUsage(idx, seat, r) }
             else if !r.cancelled { synthesisError = r.error ?? "Failed" }   // transient, never persisted as content
         }
@@ -848,32 +1314,31 @@ public final class CouncilStore {
         let idx = rounds.count - 1
         guard idx == viewingRound, rounds.indices.contains(idx), !anyLoading,
               let seat = seats.first(where: { $0.id == seatID }), hasKey(seat) else { return }
-        // The original answer used an attached image/document, which isn't kept in the saved round (by
-        // design). We can't reproduce it, so refuse rather than silently re-ask the model about an
-        // attachment it never receives — which would yield a confident answer about nothing.
-        if rounds[idx].hadAttachment {
-            status[seatID] = .failed("Can't regenerate — this answer used an attachment, which Council doesn't keep. Start a new directive to re-attach it.")
+        // A round whose attachment we kept can be re-asked exactly as it was asked. One we didn't
+        // (an image, or a document too large to store) still can't: re-asking without it would get
+        // a confident answer about nothing, so refuse instead of faking it.
+        let storedDoc = rounds[idx].attachedDocument
+        if rounds[idx].hadAttachment, storedDoc == nil {
+            status[seatID] = .failed("Can't regenerate — this answer used an image or an oversized document, which Council doesn't keep. Start a new directive to re-attach it.")
             return
         }
         let q = rounds[idx].question
+        // Same fold as ask(): the document rides on the request, never into the saved question.
+        let effectiveQ = storedDoc.map { "\(q)\n\n--- ATTACHED DOCUMENT ---\n\n\($0)" } ?? q
         // Only drop this seat's last exchange from history if it actually succeeded (so a
         // retry-after-failure doesn't wrongly delete a previous round's exchange).
         let hadAnswer = !((rounds[idx].answers[seatID] ?? "").isEmpty)
         if hadAnswer, var h = history[seatID], h.count >= 2 { h.removeLast(2); history[seatID] = h }
         // Changing one answer invalidates every peer review (they all read the old set), the rebuttal
         // round, and both cross-model artifacts — clear them all so nothing stale survives next to
-        // the new answer (a surviving rebuttal would also lock DEBATE for this round forever).
-        rounds[idx].peerReviews.removeAll()
-        rounds[idx].rebuttals.removeAll()
-        rounds[idx].divergence = nil
-        rounds[idx].divergenceScore = nil; rounds[idx].divergenceCamps = nil
-        rounds[idx].outlier = nil; rounds[idx].outlierSeatID = nil
-        rounds[idx].synthesis = nil
-        divergenceError = nil; synthesisError = nil
+        // the new answer (a surviving rebuttal would also lock DEBATE for this round forever). The
+        // deliberation selection resets too: the participant set's content changed under it.
+        invalidateDeliberation(idx)
+        rounds[idx].includedSeatIDs = nil
         rounds[idx].answers[seatID] = ""
         status[seatID] = .loading
         generatingRound = idx
-        let messages = [ChatMessage.system(systemPrompt(for: seat))] + (history[seatID] ?? []) + [.user(q)]
+        let messages = [ChatMessage.system(systemPrompt(for: seat))] + (history[seatID] ?? []) + [.user(effectiveQ)]
         let r = await streamCall(seat: seat, messages: messages) { partial in
             self.setAnswer(idx, seatID, partial)
         }
@@ -889,6 +1354,7 @@ public final class CouncilStore {
         pipelineStage = nil
         livePeerReviews = [:]; liveRebuttals = [:]
         liveDivergence = nil; liveSynthesis = nil
+        liveChairSummary = nil
     }
 
     // MARK: - Round helpers
@@ -943,45 +1409,138 @@ public final class CouncilStore {
                              + Double(r.output) / 1_000_000 * rates.outputPer1M
     }
 
-    /// Build the answers for the synthesizer with ANONYMOUS, shuffled labels (Advisor A/B/C) so it
-    /// can't tell which answer is its own and favor it. Returns the context plus a map from each
-    /// anonymous label back to the real provider name (used to restore attribution in the output).
+    /// Build the positions for the synthesizer with ANONYMOUS, shuffled labels (Advisor A/B/C) so it
+    /// can't tell which answer is its own and favor it. The guest answer is one more shuffled block —
+    /// indistinguishable from a real advisor. Returns the context plus a map from each anonymous
+    /// label back to the real display name (used to restore attribution in the output).
     private func anonymizedContext(_ idx: Int) -> (context: String, remap: [String: String], seatByLabel: [String: Int]) {
-        let answered = answeredSeats(in: idx).shuffled()
-        let names = uniqueNames(for: answered)
+        // Derive names from the UNSHUFFLED participant order, then shuffle only the label→participant
+        // assignment. Deriving them post-shuffle made a collision suffix ("Claude (1)"/"Claude (2)")
+        // land on a different seat per stage, so peer review and synthesis disagreed about who was who.
+        let ordered = participants(in: idx)
+        let names = uniqueNames(for: ordered.map { (id: $0.id, base: $0.name) })
+        let parts = ordered.shuffled()
         var blocks: [String] = []
         var remap: [String: String] = [:]
-        var seatByLabel: [String: Int] = [:]   // lowercased label → seat id (verdict outlier resolution)
-        for (i, s) in answered.enumerated() {
+        var seatByLabel: [String: Int] = [:]   // lowercased label → participant id (verdict outlier resolution)
+        for (i, p) in parts.enumerated() {
             let label = "Advisor \(String(UnicodeScalar(65 + i)!))"   // Advisor A, B, C…
-            remap[label] = names[s.id] ?? s.provider?.panelName ?? "Advisor"
-            seatByLabel[label.lowercased()] = s.id
-            blocks.append("\(label):\n\(rounds[idx].answers[s.id] ?? "")")
+            remap[label] = names[p.id] ?? "Advisor"
+            seatByLabel[label.lowercased()] = p.id
+            blocks.append("\(label):\n\(p.answer)")
         }
         return (blocks.joined(separator: "\n\n"), remap, seatByLabel)
     }
 
-    /// Put the real provider names back into a generated artifact, for display. Process labels
-    /// longest-first so a shorter label ("Advisor A") can't garble a longer one ("Advisor AB") as a
-    /// substring; `uniqueNames` keeps the target names distinct so duplicate providers stay readable.
+    /// Put the real provider names back into a generated artifact, for display.
+    ///
+    /// ONE pass over the text, longest labels first, never re-scanning what was already written —
+    /// a sequential replace could substitute into its own output (a guest the user literally named
+    /// "Advisor B" made the pass rewrite an earlier "Advisor A" result a second time).
+    ///
+    /// Matching is deliberately tolerant, because models echo the label back in their own spelling:
+    /// a live llama3.2 run wrote "Adviser A"/"Adviser B" and the strict pass left those raw labels
+    /// on screen next to real names — meaningless to the reader. Case, inner whitespace, and that
+    /// one-letter misspelling are all accepted.
     private func deAnonymize(_ text: String, _ remap: [String: String]) -> String {
-        var out = text
-        for label in remap.keys.sorted(by: { $0.count > $1.count }) {
-            out = out.replacingOccurrences(of: label, with: remap[label] ?? label)
+        guard !remap.isEmpty else { return text }
+        var aliases: [(needle: String, replacement: String)] = []
+        for (label, name) in remap {
+            aliases.append((label, name))
+            if let letter = label.split(separator: " ").last {
+                aliases.append(("Adviser \(letter)", name))
+            }
+        }
+        aliases.sort { $0.needle.count > $1.needle.count }
+
+        var out = ""
+        var i = text.startIndex
+        outer: while i < text.endIndex {
+            for a in aliases {
+                if let end = Self.matchLabel(a.needle, in: text, at: i) {
+                    out += a.replacement
+                    i = end
+                    continue outer
+                }
+            }
+            out.append(text[i])
+            i = text.index(after: i)
         }
         return out
     }
 
-    /// Map each seat to a UNIQUE display name. Two seats on the same provider would otherwise both
-    /// de-anonymize to e.g. "Claude" and become indistinguishable to the reader — append "(1)"/"(2)"
-    /// only when there is an actual collision.
-    private func uniqueNames(for seats: [Seat]) -> [Int: String] {
-        let counts = Dictionary(grouping: seats) { $0.provider?.panelName ?? "Advisor" }.mapValues(\.count)
+    /// Test seam for the de-anonymization pass (it's the one piece of display logic that has
+    /// silently regressed in a live run before).
+    func deAnonymizeForTesting(_ text: String, _ remap: [String: String]) -> String {
+        deAnonymize(text, remap)
+    }
+
+    /// The human-readable half of a merged divergence answer — everything before the verdict
+    /// sentinel. Applied to partial text too, so the JSON tail never flashes on screen. A model
+    /// that emitted no sentinel simply keeps its whole answer.
+    nonisolated static func narrativePart(_ text: String) -> String {
+        guard let r = text.range(of: verdictSentinel) else { return text }
+        return String(text[..<r.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The machine-readable half, or nil when the model never emitted the sentinel.
+    nonisolated static func verdictPart(_ text: String) -> String? {
+        guard let r = text.range(of: verdictSentinel) else { return nil }
+        return String(text[r.upperBound...])
+    }
+
+    /// Commit a parsed verdict onto a round. Returns false when there was nothing usable to
+    /// commit, which is the caller's signal to fall back to the separate judge call.
+    @discardableResult
+    private func applyVerdict(_ v: (agreement: Int, camps: Int?, outlier: String?)?,
+                              idx: Int, remap: [String: String], seatByLabel: [String: Int]) -> Bool {
+        guard let v, rounds.indices.contains(idx) else { return false }
+        rounds[idx].divergenceScore = v.agreement
+        rounds[idx].divergenceCamps = v.camps
+        // With exactly two positions "the outlier" is undefined — either side of a symmetric
+        // disagreement would do, so a pick is fake precision. Score + camps still stand.
+        if let label = v.outlier, participants(in: idx).count > 2 {
+            let k = label.lowercased().trimmingCharacters(in: .whitespaces)
+            rounds[idx].outlierSeatID = seatByLabel[k]
+            rounds[idx].outlier = remap[label]
+                ?? remap.first { $0.key.lowercased() == k }?.value
+                ?? label
+        } else {
+            rounds[idx].outlierSeatID = nil
+            rounds[idx].outlier = nil
+        }
+        return true
+    }
+
+    /// Case-insensitive match of `needle` at `start`, where a space in the needle matches any run
+    /// of whitespace. Returns the index just past the match, or nil if it doesn't match here.
+    private static func matchLabel(_ needle: String, in text: String, at start: String.Index) -> String.Index? {
+        var t = start
+        var n = needle.startIndex
+        while n < needle.endIndex {
+            guard t < text.endIndex else { return nil }
+            if needle[n] == " " {
+                guard text[t].isWhitespace else { return nil }
+                while t < text.endIndex, text[t].isWhitespace { t = text.index(after: t) }
+                n = needle.index(after: n)
+                continue
+            }
+            guard text[t].lowercased() == needle[n].lowercased() else { return nil }
+            t = text.index(after: t)
+            n = needle.index(after: n)
+        }
+        return t
+    }
+
+    /// Map each participant to a UNIQUE display name. Two seats on the same provider — or a guest
+    /// the user named after a real seat's provider — would otherwise de-anonymize to the same name
+    /// and become indistinguishable to the reader; append "(1)"/"(2)" only on an actual collision.
+    private func uniqueNames(for entries: [(id: Int, base: String)]) -> [Int: String] {
+        let counts = Dictionary(grouping: entries, by: \.base).mapValues(\.count)
         var seen: [String: Int] = [:]; var out: [Int: String] = [:]
-        for s in seats {
-            let base = s.provider?.panelName ?? "Advisor"
-            if (counts[base] ?? 0) > 1 { let n = (seen[base] ?? 0) + 1; seen[base] = n; out[s.id] = "\(base) (\(n))" }
-            else { out[s.id] = base }
+        for e in entries {
+            if (counts[e.base] ?? 0) > 1 { let n = (seen[e.base] ?? 0) + 1; seen[e.base] = n; out[e.id] = "\(e.base) (\(n))" }
+            else { out[e.id] = e.base }
         }
         return out
     }
@@ -1003,27 +1562,14 @@ public final class CouncilStore {
         // Parse the RAW output — the outlier is still an anonymous label ("Advisor B"), which we
         // resolve to a seat id HERE (case-insensitively). Matching by display name later is fragile:
         // duplicate providers share a panel name, and judges drift on label casing.
-        guard let raw = try? await client.judge(messages: [.system(Self.verdictPrompt), .user(user)], apiKey: key),
-              let v = Self.parseVerdictJSON(raw) else { return }
-        if rounds.indices.contains(idx) {
-            rounds[idx].divergenceScore = v.agreement
-            rounds[idx].divergenceCamps = v.camps
-            if let label = v.outlier {
-                let k = label.lowercased().trimmingCharacters(in: .whitespaces)
-                rounds[idx].outlierSeatID = seatByLabel[k]
-                rounds[idx].outlier = remap[label]
-                    ?? remap.first { $0.key.lowercased() == k }?.value
-                    ?? label
-            } else {
-                rounds[idx].outlierSeatID = nil
-                rounds[idx].outlier = nil
-            }
-        }
+        guard let raw = try? await client.judge(messages: [.system(Self.verdictPrompt), .user(user)], apiKey: key)
+        else { return }
+        applyVerdict(Self.parseVerdictJSON(raw), idx: idx, remap: remap, seatByLabel: seatByLabel)
     }
 
     /// Robust parse of the judge's JSON — tolerant of the schema drift small models produce (camps as
     /// an array → use its count, agreement as a string, "none"/null outliers).
-    private static func parseVerdictJSON(_ text: String) -> (agreement: Int, camps: Int?, outlier: String?)? {
+    nonisolated static func parseVerdictJSON(_ text: String) -> (agreement: Int, camps: Int?, outlier: String?)? {
         guard let s = text.firstIndex(of: "{"), let e = text.lastIndex(of: "}"), s < e,
               let data = String(text[s...e]).data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
@@ -1064,26 +1610,33 @@ public final class CouncilStore {
         // Ollama, a brief blip). The long streaming connection is what tends to fail, so we re-run
         // from scratch once before surfacing the error — the seat stays in its loading state throughout.
         let gate = FlushGate()
-        var lastError: Error = LLMError.message("Failed")
+        var lastMessage = "Failed"
         for attempt in 0..<2 {
             let r = await Self.pump(client: client, messages: messages, apiKey: apiKey,
-                                    gate: gate, onDelta: onDelta)
+                                    provider: provider, gate: gate, onDelta: onDelta)
             await gate.waitUntilIdle()             // the final flush below must be ordered LAST
             if !r.text.isEmpty { onDelta(r.text) } // authoritative full/partial text, on the MainActor
-            if let error = r.error {
-                if error is CancellationError || (error as? URLError)?.code == .cancelled {
-                    return (r.text.isEmpty ? nil : r.text, r.input, r.output, true, nil)
-                }
-                lastError = error
-                if attempt == 0, !Task.isCancelled, Self.isTransient(error) {
+            switch r.failure {
+            case .none:
+                return (r.text, r.input, r.output, false, nil)
+            case .cancelled:
+                return (r.text.isEmpty ? nil : r.text, r.input, r.output, true, nil)
+            case .stalled(let m):
+                // Deliberately NOT retried: a backend that went quiet once will almost always go
+                // quiet again, and a second 90s wait is 90s the whole council spends blocked.
+                return (r.text.isEmpty ? nil : r.text, r.input, r.output, false, m)
+            case .transient(let m):
+                lastMessage = m
+                if attempt == 0, !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 500_000_000)   // brief backoff, then re-run once
                     continue
                 }
-                return (nil, r.input, r.output, false, Self.friendlyError(error, provider: provider))
+                return (nil, r.input, r.output, false, m)
+            case .permanent(let m):
+                return (nil, r.input, r.output, false, m)
             }
-            return (r.text, r.input, r.output, false, nil)
         }
-        return (nil, 0, 0, false, Self.friendlyError(lastError, provider: provider))
+        return (nil, 0, 0, false, lastMessage)
     }
 
     /// The network pump — deliberately `nonisolated`, so it runs on the GLOBAL executor, never the
@@ -1092,16 +1645,72 @@ public final class CouncilStore {
     /// MainActor, so holding the mouse down over text froze all three answers mid-flight.
     /// UI flushes are throttled (10Hz/seat), FIRE-AND-FORGET (never block the network), and
     /// serialized through `gate` so at most one is in flight and the caller's final flush wins.
+    /// Runs the stream and races it against a stall watchdog, so one wedged backend can't hold the
+    /// round. Cancellation from above (Stop) is forwarded to the inner task explicitly — an
+    /// unstructured `Task` does not inherit it.
+    /// Test seam for the stall watchdog — the one behaviour that needs a fake backend to prove.
+    nonisolated static func pumpForTesting(
+        client: any LLMClient, provider: LLMProvider = .ollama
+    ) async -> PumpOutcome {
+        await pump(client: client, messages: [.user("hi")], apiKey: "",
+                   provider: provider, gate: FlushGate(), onDelta: { _ in })
+    }
+
     private nonisolated static func pump(
         client: any LLMClient, messages: [ChatMessage], apiKey: String,
-        gate: FlushGate, onDelta: @escaping @MainActor (String) -> Void
-    ) async -> (text: String, input: Int, output: Int, error: Error?) {
+        provider: LLMProvider, gate: FlushGate, onDelta: @escaping @MainActor (String) -> Void
+    ) async -> PumpOutcome {
+        let liveness = StreamLiveness()
+        let streaming = Task {
+            await rawPump(client: client, messages: messages, apiKey: apiKey,
+                          provider: provider, gate: gate, liveness: liveness, onDelta: onDelta)
+        }
+        let watchdog = Task {
+            let limit = UInt64(max(1, CouncilLimits.stallTimeoutSeconds) * 1_000_000_000)
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { return }
+                if await liveness.idleNanos() >= limit {
+                    await liveness.markTimedOut()
+                    streaming.cancel()
+                    return
+                }
+            }
+        }
+        var outcome = await withTaskCancellationHandler {
+            await streaming.value
+        } onCancel: {
+            streaming.cancel()
+        }
+        watchdog.cancel()
+        // The watchdog cancels the same way Stop does, so the classification is corrected here —
+        // this is the only place that can tell the two apart.
+        if await liveness.timedOut {
+            let secs = Int(CouncilLimits.stallTimeoutSeconds)
+            outcome.failure = .stalled(
+                "\(provider.panelName) stopped responding (nothing for \(secs)s) — the council finished without it.")
+        }
+        return outcome
+    }
+
+    /// The network pump — deliberately `nonisolated`, so it runs on the GLOBAL executor, never the
+    /// MainActor. A main-thread stall (a held text-selection mouse-tracking loop, a menu, a heavy
+    /// commit) must not stall the model streams — it used to: every SSE chunk hopped through the
+    /// MainActor, so holding the mouse down over text froze all three answers mid-flight.
+    /// UI flushes are throttled (10Hz/seat), FIRE-AND-FORGET (never block the network), and
+    /// serialized through `gate` so at most one is in flight and the caller's final flush wins.
+    private nonisolated static func rawPump(
+        client: any LLMClient, messages: [ChatMessage], apiKey: String,
+        provider: LLMProvider, gate: FlushGate, liveness: StreamLiveness,
+        onDelta: @escaping @MainActor (String) -> Void
+    ) async -> PumpOutcome {
         let minInterval: UInt64 = 100_000_000   // 100ms — 10Hz per seat; 3 seats ≈ 30 UI flushes/sec
         var full = "", input = 0, output = 0
         var lastEmit: UInt64 = 0
         do {
             for try await chunk in client.stream(messages: messages, apiKey: apiKey) {
                 try Task.checkCancellation()   // Stop → exit → stream terminates → network cancels
+                await liveness.touch()         // proof of life for the stall watchdog
                 switch chunk {
                 case .text(let t):
                     full += t
@@ -1114,15 +1723,24 @@ public final class CouncilStore {
                 case .usage(let i, let o): input = i; output = o
                 }
             }
-            return (full, input, output, nil)
+            return PumpOutcome(text: full, input: input, output: output, failure: nil)
         } catch {
-            return (full, input, output, error)   // partial text survives cancel/failure
+            // Partial text survives cancel/failure; classify here so the outcome stays Sendable.
+            let failure: PumpFailure
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                failure = .cancelled
+            } else if isTransient(error) {
+                failure = .transient(friendlyError(error, provider: provider))
+            } else {
+                failure = .permanent(friendlyError(error, provider: provider))
+            }
+            return PumpOutcome(text: full, input: input, output: output, failure: failure)
         }
     }
 
     /// A transient connection failure worth one automatic retry (vs a permanent auth/model error,
     /// which a retry wouldn't fix).
-    private static func isTransient(_ error: Error) -> Bool {
+    private nonisolated static func isTransient(_ error: Error) -> Bool {
         guard let u = error as? URLError else { return false }
         switch u.code {
         case .networkConnectionLost, .timedOut, .cannotConnectToHost, .cannotFindHost,
@@ -1134,7 +1752,7 @@ public final class CouncilStore {
 
     /// Turn a raw networking error into a clear, provider-aware message. The common confusing case
     /// is a local Ollama that simply isn't running — say so plainly instead of "Could not connect…".
-    private static func friendlyError(_ error: Error, provider: LLMProvider) -> String {
+    private nonisolated static func friendlyError(_ error: Error, provider: LLMProvider) -> String {
         if let urlError = error as? URLError {
             switch urlError.code {
             case .cannotConnectToHost, .cannotFindHost, .networkConnectionLost,
@@ -1161,13 +1779,24 @@ public final class CouncilStore {
         func name(_ round: Round, _ seatID: Int) -> String {
             round.answerProviders[seatID] ?? seats.first { $0.id == seatID }?.provider?.panelName ?? "Advisor"
         }
+        // A seat that answered but was excluded from deliberation gets an honest "(sat out)" tag —
+        // only on rounds that actually deliberated, or every answer in an un-analyzed round would
+        // read as having been left out of something that never happened.
+        func satOut(_ round: Round, _ seatID: Int) -> String {
+            guard round.peerReviews.values.contains(where: { !$0.isEmpty }) || round.divergence != nil,
+                  let inc = round.includedSeatIDs, !inc.contains(seatID) else { return "" }
+            return " *(sat out of deliberation)*"
+        }
         var out = "# Council\n\n"
         for (i, round) in rounds.enumerated() where !round.answeredSeatIDs.isEmpty {
             out += "## Round \(i + 1) — \(round.question)\n\n"
             for seat in seats where !((round.answers[seat.id] ?? "").isEmpty) {
                 // Only attach the model id when this seat's current provider is the one that answered.
                 let model = (seat.provider?.panelName == round.answerProviders[seat.id]) ? " — `\(seat.model)`" : ""
-                out += "### \(name(round, seat.id))\(model)\n\n\(round.answers[seat.id] ?? "")\n\n"
+                out += "### \(name(round, seat.id))\(model)\(satOut(round, seat.id))\n\n\(round.answers[seat.id] ?? "")\n\n"
+            }
+            if let g = round.guestAnswer {
+                out += "### \(round.guestName) — guest (pasted answer)\(satOut(round, Round.guestSeatID))\n\n\(g)\n\n"
             }
             let reviews = seats.filter { !((round.peerReviews[$0.id] ?? "").isEmpty) }
             if !reviews.isEmpty {
@@ -1181,6 +1810,7 @@ public final class CouncilStore {
             }
             if let d = round.divergence { out += "#### Divergence\n\n\(d)\n\n" }
             if let s = round.synthesis { out += "#### Synthesis\n\n\(s)\n\n" }
+            if let c = round.chairSummary { out += "#### Chair's summary\n\n\(c)\n\n" }
         }
         if let cur = sessions.first(where: { $0.id == currentSessionID }),
            let d = cur.decision, !d.isEmpty {
@@ -1193,19 +1823,22 @@ public final class CouncilStore {
     /// A decision-ready Markdown memo for the VIEWED round — readable enough to paste into a
     /// design doc or ADR as-is. Excerpts (not full transcripts) for answers; full synthesis.
     /// No keys, no internal ids.
+    /// First markdown paragraph of a text, capped — a deterministic, zero-cost "summary".
+    /// Shared by the decision memo and the Engram memory composer.
+    private static func excerpt(_ text: String, cap: Int = 500) -> String {
+        let para = text
+            .components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty && !$0.hasPrefix("#") } ?? text
+        let flat = para.replacingOccurrences(of: "\n", with: " ")
+        return flat.count <= cap ? flat : String(flat.prefix(cap)).trimmingCharacters(in: .whitespaces) + "…"
+    }
+
     public func exportDecisionMemo() -> String {
         guard rounds.indices.contains(viewingRound) else { return "" }
         let round = rounds[viewingRound]
 
-        /// First markdown paragraph of a text, capped — a deterministic, zero-cost "summary".
-        func excerpt(_ text: String, cap: Int = 500) -> String {
-            let para = text
-                .components(separatedBy: "\n\n")
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .first { !$0.isEmpty && !$0.hasPrefix("#") } ?? text
-            let flat = para.replacingOccurrences(of: "\n", with: " ")
-            return flat.count <= cap ? flat : String(flat.prefix(cap)).trimmingCharacters(in: .whitespaces) + "…"
-        }
+        func excerpt(_ text: String, cap: Int = 500) -> String { Self.excerpt(text, cap: cap) }
         func name(_ seatID: Int) -> String {
             round.answerProviders[seatID] ?? seats.first { $0.id == seatID }?.provider?.panelName ?? "Advisor"
         }
@@ -1215,16 +1848,27 @@ public final class CouncilStore {
         out += "*\(df.string(from: Date()))*\n\n"
         out += "## Question\n\n\(round.question)\n\n"
 
+        func satOut(_ seatID: Int) -> String {
+            guard round.peerReviews.values.contains(where: { !$0.isEmpty }) || round.divergence != nil,
+                  let inc = round.includedSeatIDs, !inc.contains(seatID) else { return "" }
+            return " (sat out)"
+        }
         out += "## Council\n\n"
         for seat in seats where round.answers[seat.id]?.isEmpty == false {
             let model = (seat.provider?.panelName == round.answerProviders[seat.id]) ? " — `\(seat.model)`" : ""
-            out += "- \(name(seat.id))\(model)\n"
+            out += "- \(name(seat.id))\(model)\(satOut(seat.id))\n"
+        }
+        if round.guestAnswer != nil {
+            out += "- \(round.guestName) — guest (pasted answer)\(satOut(Round.guestSeatID))\n"
         }
         out += "\n## Answers (excerpts)\n\n"
         for seat in seats {
             if let a = round.answers[seat.id], !a.isEmpty {
                 out += "**\(name(seat.id)):** \(excerpt(a))\n\n"
             }
+        }
+        if let g = round.guestAnswer {
+            out += "**\(round.guestName) (guest):** \(excerpt(g))\n\n"
         }
 
         if let agreement = round.divergenceScore {
@@ -1244,6 +1888,9 @@ public final class CouncilStore {
         if let s = round.synthesis, !s.isEmpty {
             out += "## Synthesis\n\n\(s)\n\n"
         }
+        if let c = round.chairSummary, !c.isEmpty {
+            out += "## Chair's summary\n\n\(c)\n\n"
+        }
         if let cur = sessions.first(where: { $0.id == currentSessionID }),
            let d = cur.decision, !d.isEmpty {
             out += "## Decision\n\n\(d)\n\n"
@@ -1262,6 +1909,14 @@ public final class CouncilStore {
 
     public static var sessionsFolderURL: URL? {
         let fm = FileManager.default
+        // Explicit override — used by the unit tests (which must never touch the real container:
+        // enumerating another app's container from an unsigned test binary blocks the whole suite
+        // on a TCC prompt) and available to power users who want history elsewhere.
+        if let override = ProcessInfo.processInfo.environment["COUNCIL_SESSIONS_DIR"], !override.isEmpty {
+            let dir = URL(fileURLWithPath: override, isDirectory: true)
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            return dir
+        }
         // Inside the sandboxed app, application-support already resolves into the app container.
         // A NON-sandboxed process (the `council` CLI) must target that container explicitly, so
         // CLI runs land in the same history the app shows.
@@ -1321,14 +1976,50 @@ public final class CouncilStore {
         // so a plain rebuild would silently wipe them on the next save.
         s.decision = prior?.decision; s.decisionAt = prior?.decisionAt
         s.outcome = prior?.outcome; s.outcomeAt = prior?.outcomeAt
-        if let url = sessionURL(s.id), let data = try? Self.sessionCoder.enc.encode(s) {
-            // Atomic disk write off the MainActor (Data is Sendable) so the I/O doesn't hitch the UI.
-            Task.detached(priority: .utility) { try? data.write(to: url, options: .atomic) }
-        }
+        s.remindAt = prior?.remindAt
+        s.engramMemoryID = prior?.engramMemoryID; s.engramRememberedAt = prior?.engramRememberedAt
+        // In-memory state updates immediately (the UI reads `sessions`); the DISK write is
+        // coalesced. Encoding a whole session — every round, every review, every synthesis — is the
+        // expensive half, and rapid callers (a deliberation-chip tap, several stages finishing
+        // together) used to pay it in full each time.
         sessions.removeAll { $0.id == s.id }
         sessions.insert(s, at: 0)
         haystackCache[s.id] = nil   // its transcript changed → rebuild on next search
+        scheduleSessionWrite(s.id)
         checkSpendAlert()
+    }
+
+    /// Pending coalesced disk write, if one is queued.
+    private var pendingWrite: (id: UUID, task: Task<Void, Never>)?
+
+    /// Queue a debounced write of one session. A newer call replaces an older pending one for the
+    /// same session, so a burst of mutations costs a single encode + a single atomic write.
+    private func scheduleSessionWrite(_ id: UUID, delay: Duration = .milliseconds(400)) {
+        guard persistenceEnabled else { return }
+        if let p = pendingWrite, p.id == id { p.task.cancel() }
+        else if pendingWrite != nil { flushPendingWrite() }   // different session → don't lose it
+        pendingWrite = (id, Task { @MainActor [weak self] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled, let self else { return }
+            self.pendingWrite = nil
+            self.writeSessionNow(id)
+        })
+    }
+
+    /// Write any queued session immediately. Call before anything that must not lose the last edit
+    /// (quitting, switching sessions, deleting).
+    public func flushPendingWrite() {
+        guard let p = pendingWrite else { return }
+        p.task.cancel()
+        pendingWrite = nil
+        writeSessionNow(p.id)
+    }
+
+    private func writeSessionNow(_ id: UUID) {
+        guard persistenceEnabled, let s = sessions.first(where: { $0.id == id }),
+              let url = sessionURL(id), let data = try? Self.sessionCoder.enc.encode(s) else { return }
+        // Atomic disk write off the MainActor (Data is Sendable) so the I/O doesn't hitch the UI.
+        Task.detached(priority: .utility) { try? data.write(to: url, options: .atomic) }
     }
 
     // MARK: - Decision journal (local only)
@@ -1338,22 +2029,117 @@ public final class CouncilStore {
         sessions.filter { ($0.decision?.isEmpty == false) }
                 .sorted { ($0.decisionAt ?? .distantPast) > ($1.decisionAt ?? .distantPast) }
     }
+    /// Journal entries matching a free-text query over the decision, the outcome and the session
+    /// title — the journal is where the value accumulates, so it has to be findable years later.
+    public func searchedJournal(_ query: String) -> [Session] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return journal }
+        return journal.filter {
+            $0.title.lowercased().contains(q)
+                || ($0.decision ?? "").lowercased().contains(q)
+                || ($0.outcome ?? "").lowercased().contains(q)
+        }
+    }
+
+    /// Decisions with no outcome recorded yet — the open loops, whether or not a reminder was set.
+    public var awaitingOutcome: [Session] {
+        journal.filter { ($0.outcome ?? "").isEmpty }
+    }
+
+    /// The whole decision journal as one Markdown document: what you decided, when, how it turned
+    /// out, and the question that prompted it. Deliberately NOT the transcripts — this is the log
+    /// of judgements, which is the part worth keeping.
+    public func exportJournal() -> String {
+        let df = DateFormatter(); df.dateStyle = .medium; df.timeStyle = .none
+        var out = "# Decision journal\n\n"
+        let entries = journal
+        guard !entries.isEmpty else { return out + "_No decisions recorded yet._\n" }
+        let closed = entries.filter { !($0.outcome ?? "").isEmpty }.count
+        out += "_\(entries.count) decision\(entries.count == 1 ? "" : "s") · \(closed) with an outcome recorded._\n\n"
+        for s in entries {
+            out += "## \(s.title.isEmpty ? "Untitled" : s.title)\n\n"
+            if let at = s.decisionAt { out += "*\(df.string(from: at))*\n\n" }
+            if let q = s.rounds.last?.question, !q.isEmpty {
+                out += "**Question:** \(Self.excerpt(q, cap: 300))\n\n"
+            }
+            out += "**Decided:** \(s.decision ?? "")\n\n"
+            if let o = s.outcome, !o.isEmpty {
+                out += "**How it turned out:** \(o)"
+                if let oa = s.outcomeAt { out += " *(\(df.string(from: oa)))*" }
+                out += "\n\n"
+            } else {
+                out += "*Outcome not recorded yet.*\n\n"
+            }
+            out += "---\n\n"
+        }
+        return out
+    }
+
     /// Record (or update) what the user actually decided after this council.
     public func recordDecision(_ text: String, for id: UUID) {
         if id == currentSessionID && !sessions.contains(where: { $0.id == id }) { saveConversation() }
         updateSession(id) { $0.decision = text; $0.decisionAt = Date() }
     }
     /// Record how a past decision turned out — closing the loop on whether the council's read held up.
+    /// Logging the outcome also clears any pending reminder: the loop is closed.
     public func recordOutcome(_ text: String, for id: UUID) {
-        updateSession(id) { $0.outcome = text; $0.outcomeAt = Date() }
+        updateSession(id) { $0.outcome = text; $0.outcomeAt = Date(); $0.remindAt = nil }
+    }
+
+    /// Set (or clear, with nil) the outcome reminder on a journal entry.
+    public func setReminder(_ date: Date?, for id: UUID) {
+        updateSession(id) { $0.remindAt = date }
+    }
+
+    /// Journal entries whose reminder has come due — decision logged, outcome still open, remindAt
+    /// passed. Computed against Date() on read: dueness refreshes on launch and on interaction,
+    /// which is the right granularity for week-scale reminders (deliberately NO timer — @Observable
+    /// can't track wall-clock time, and a ticking clock for a calm weekly nudge is noise).
+    public var dueReminders: [Session] {
+        let now = Date()
+        return sessions.filter {
+            ($0.decision?.isEmpty == false) && (($0.outcome ?? "").isEmpty)
+                && ($0.remindAt.map { $0 <= now } ?? false)
+        }
+        .sorted { ($0.remindAt ?? .distantPast) < ($1.remindAt ?? .distantPast) }
+    }
+
+    // MARK: - Engram bridge (engine side: pure text + markers; the app does the writing)
+
+    /// A short, self-contained memory of a journal decision, for the user's Engram store. Contains
+    /// ONLY journal fields + the round's public verdict — never keys, transcripts, or attachments.
+    public func engramMemoryText(for session: Session) -> String {
+        let df = ISO8601DateFormatter(); df.formatOptions = [.withFullDate]
+        var out = "Council decision"
+        if let at = session.decisionAt { out += " (\(df.string(from: at)))" }
+        out += ": \(session.decision ?? "")"
+        if let q = session.rounds.last?.question, !q.isEmpty {
+            out += "\nQuestion: \(Self.excerpt(q, cap: 200))"
+        }
+        if let r = session.rounds.last, let agreement = r.divergenceScore {
+            out += "\nCouncil divergence: \(100 - agreement)/100"
+            if let o = r.outlier { out += " — dissent from \(o)" }
+        }
+        if let o = session.outcome, !o.isEmpty {
+            out += "\nOutcome: \(o)"
+        }
+        return out
+    }
+
+    /// Mark a journal entry as remembered in Engram (persists the marker with the session).
+    public func markRememberedInEngram(_ id: UUID, memoryID: UUID) {
+        updateSession(id) { $0.engramMemoryID = memoryID; $0.engramRememberedAt = Date() }
     }
     private func updateSession(_ id: UUID, _ mutate: (inout Session) -> Void) {
         guard let i = sessions.firstIndex(where: { $0.id == id }) else { return }
         mutate(&sessions[i])
         haystackCache[id] = nil   // the journal text is searchable → rebuild on next search
-        if let url = sessionURL(id), let data = try? Self.sessionCoder.enc.encode(sessions[i]) {
-            try? data.write(to: url, options: .atomic)
-        }
+        // Same no-trace gate as every other write path: a non-persisting store (facade, --no-save,
+        // tests) mutates only its in-memory copy.
+        guard persistenceEnabled else { return }
+        // Journal edits are deliberate, low-frequency and easy to lose track of (typing an outcome,
+        // setting a reminder), so they go straight to disk rather than through the debounce.
+        writeSessionNow(id)
     }
 
     /// Rebuild each seat's replay history from saved rounds. `history` is no longer persisted in the
@@ -1363,7 +2149,8 @@ public final class CouncilStore {
     static func reconstructHistory(from rounds: [Round]) -> [Int: [ChatMessage]] {
         var h: [Int: [ChatMessage]] = [:]
         for r in rounds {
-            for (seatID, answer) in r.answers where !answer.isEmpty {
+            // The guest sentinel never calls a model, so it has no replay history.
+            for (seatID, answer) in r.answers where !answer.isEmpty && seatID != Round.guestSeatID {
                 h[seatID, default: []].append(.user(r.question))
                 h[seatID, default: []].append(.assistant(answer))
             }
@@ -1386,11 +2173,13 @@ public final class CouncilStore {
 
     public func openSession(_ s: Session) {
         guard !anyLoading else { return }   // don't swap rounds out from under a running task
+        flushPendingWrite()                 // never carry a queued write across a session switch
         apply(s)
     }
 
     public func newSession() {
         guard !anyLoading else { return }
+        flushPendingWrite()   // the session being left must land on disk complete
         currentSessionID = UUID()
         currentTitle = ""
         currentCreatedAt = Date()
@@ -1400,6 +2189,7 @@ public final class CouncilStore {
         liveAnswers = [:]
         livePeerReviews = [:]; liveRebuttals = [:]
         liveDivergence = nil; liveSynthesis = nil
+        liveChairSummary = nil
         history = [:]
         clearDeliberationErrors()
     }
@@ -1410,14 +2200,15 @@ public final class CouncilStore {
         if id == currentSessionID { currentTitle = t }
         guard let idx = sessions.firstIndex(where: { $0.id == id }) else { return }
         sessions[idx].title = t
-        if let url = sessionURL(id), let data = try? Self.sessionCoder.enc.encode(sessions[idx]) {
-            try? data.write(to: url, options: .atomic)
-        }
+        guard persistenceEnabled else { return }
+        writeSessionNow(id)
     }
 
     public func deleteSession(_ id: UUID) {
         // Deleting the active session resets rounds → must not happen mid-generation.
         if id == currentSessionID && anyLoading { return }
+        // Drop any queued write for this session, or it would recreate the file after deletion.
+        if let p = pendingWrite, p.id == id { p.task.cancel(); pendingWrite = nil }
         if let url = sessionURL(id) { try? FileManager.default.removeItem(at: url) }
         sessions.removeAll { $0.id == id }
         if id == currentSessionID { newSession() }

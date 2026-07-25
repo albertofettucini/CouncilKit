@@ -89,6 +89,23 @@ public enum LLMProvider: String, CaseIterable, Identifiable, Codable {
         }
     }
 
+    /// Whether this backend can reliably append a machine-readable verdict to a markdown answer in
+    /// ONE call. Where it can, the divergence narrative and its score come back together and the
+    /// round saves a second full-context call; where it can't, the two stay separate (the split
+    /// exists precisely because small models drop or mangle a trailing JSON object).
+    ///
+    /// Deliberately conservative — only the frontier labs' own APIs, because the rest can be
+    /// pointed at a model of any size: OpenRouter and the custom slots serve whatever you route to
+    /// them, Ollama and Apple's on-device model are small by definition, and Perplexity answers in
+    /// its own search-shaped format. A wrong guess is not costly (the parse fails and the separate
+    /// verdict call runs exactly as before), but a right one saves a call on every round.
+    public var supportsMergedVerdict: Bool {
+        switch self {
+        case .claude, .openAI, .gemini, .deepSeek, .grok, .mistral: return true
+        default: return false
+        }
+    }
+
     /// Whether this provider's models accept image input. Used to avoid sending an image to a
     /// text-only model (which would hard-fail with HTTP 400). For a given seat we also check the
     /// model id, since within a provider only some models are multimodal.

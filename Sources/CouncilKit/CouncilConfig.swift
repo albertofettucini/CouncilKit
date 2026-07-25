@@ -13,6 +13,9 @@ public struct CouncilConfig: Codable, Identifiable {
     /// Index into `seats` (0-based) of the synthesizer / devil's advocate. nil = none / default.
     public var synthesizerSeatIndex: Int?
     public var devilsAdvocateSeatIndex: Int?
+    /// Optional neutral chair (provider + model only) — a non-answering moderator seat. nil = none.
+    /// Older app versions ignore this field; older files decode with no chair.
+    public var chair: SeatConfig?
 
     public struct SeatConfig: Codable {
         var provider: LLMProvider?    // nil = an intentionally-empty seat the importer fills in
@@ -27,12 +30,12 @@ public struct CouncilConfig: Codable, Identifiable {
 
     public enum CodingKeys: String, CodingKey {
         case id, name, detail, seats, sharedSystemPrompt
-        case synthesizerSeatIndex, devilsAdvocateSeatIndex, schema
+        case synthesizerSeatIndex, devilsAdvocateSeatIndex, chair, schema
     }
 
     public init(id: UUID = UUID(), name: String, detail: String? = nil, seats: [SeatConfig],
          sharedSystemPrompt: String, synthesizerSeatIndex: Int? = nil,
-         devilsAdvocateSeatIndex: Int? = nil) {
+         devilsAdvocateSeatIndex: Int? = nil, chair: SeatConfig? = nil) {
         self.id = id
         self.name = name
         self.detail = detail
@@ -40,6 +43,7 @@ public struct CouncilConfig: Codable, Identifiable {
         self.sharedSystemPrompt = sharedSystemPrompt
         self.synthesizerSeatIndex = synthesizerSeatIndex
         self.devilsAdvocateSeatIndex = devilsAdvocateSeatIndex
+        self.chair = chair
     }
 
     public init(from decoder: Decoder) throws {
@@ -51,6 +55,7 @@ public struct CouncilConfig: Codable, Identifiable {
         sharedSystemPrompt = (try? c.decode(String.self, forKey: .sharedSystemPrompt)) ?? ""
         synthesizerSeatIndex = try? c.decodeIfPresent(Int.self, forKey: .synthesizerSeatIndex)
         devilsAdvocateSeatIndex = try? c.decodeIfPresent(Int.self, forKey: .devilsAdvocateSeatIndex)
+        chair = try? c.decodeIfPresent(SeatConfig.self, forKey: .chair)
         schema = (try? c.decode(String.self, forKey: .schema)) ?? "council.v1"
     }
 }

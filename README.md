@@ -98,12 +98,16 @@ Ollama (local) · Apple Intelligence (on-device, needs macOS 26 on Apple-silicon
 (llama.cpp, LM Studio, vLLM, a second Ollama box…).
 
 By default keys come from the **macOS Keychain** (zero config) and are sent only to each provider's own
-endpoint over HTTPS (Ollama stays on `localhost`). CouncilKit never stores keys anywhere else and never
-sits between you and the provider — you pay the providers directly. No telemetry.
+endpoint over HTTPS. Local backends — Ollama and your own OpenAI-compatible servers — go wherever you
+point them, which is `localhost` unless you change it. CouncilKit never stores keys anywhere else and
+never sits between you and the provider — you pay the providers directly. No telemetry.
 
 ```swift
-try Council.setKey("sk-…", for: .claude)        // → Keychain (shared with the Council app & CLI)
+try Council.setKey("sk-…", for: .claude)   // → the Keychain, under YOUR app's bundle id
 ```
+
+Keychain items are scoped to the process that writes them, so a key saved by the Council app isn't
+visible to your app — save it once from your own binary, or pass it in code (below).
 
 Or pass keys directly in code — handy off macOS, in CI, or with your own secrets store:
 

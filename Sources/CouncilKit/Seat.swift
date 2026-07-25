@@ -4,6 +4,11 @@ import Foundation
 /// MODEL"); until then it is nil. The API key itself is not stored here — it lives in the
 /// Keychain, addressed by `provider.keychainAccount`.
 public struct Seat: Identifiable, Codable {
+    /// Reserved id for the neutral chair (an out-of-band, non-answering seat). Must never collide
+    /// with the advisor seats (0–2), the devil's-advocate "none" sentinel (-1), or the guest (99)
+    /// in the shared status/transientKeys dictionaries.
+    public static let chairID = 1000
+
     public let id: Int
     public var archetype: Archetype
     /// nil = the user hasn't picked a model for this seat yet (panel shows "PICK YOUR MODEL").

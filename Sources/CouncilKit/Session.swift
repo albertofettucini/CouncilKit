@@ -28,9 +28,33 @@ public struct Round: Codable, Identifiable {
     /// One-round "rebuttal" (bounded debate): each advisor's revised — or held — answer after seeing
     /// where the council diverged. Empty until the user runs the debate round. Persisted.
     public var rebuttals: [Int: String] = [:]
-    /// True if this round's question carried an attached image or document. Those aren't persisted
-    /// (to keep sessions small), so per-seat Regenerate can't reproduce an attachment-based answer.
+    /// True if this round's question carried an attached image or document.
     public var hadAttachment: Bool = false
+    /// The attached DOCUMENT's text, kept so Regenerate (and any later re-run of this round) asks
+    /// the model the same question it was asked the first time. Capped on the way in — see
+    /// `CouncilLimits.maxStoredAttachmentCharacters`; beyond that the round keeps only the flag,
+    /// exactly as every pre-1.2 round does. Images are still not persisted (they'd bloat sessions
+    /// by megabytes), so an image round remains un-regenerable.
+    public var attachedDocument: String? = nil
+    /// Which answers deliberate (peer review → divergence → synthesis) in this round. nil = all of
+    /// them (the default, and every pre-1.2 session). May include `guestSeatID`.
+    public var includedSeatIDs: [Int]? = nil
+    /// The neutral chair's post-debate summary, when a chair is configured. nil otherwise.
+    public var chairSummary: String? = nil
+    /// Which provider actually chaired this round — the Settings chair can change afterwards, and
+    /// a summary must keep naming the model that wrote it.
+    public var chairProvider: String? = nil
+
+    /// Reserved seat id for a pasted GUEST answer (an external AI's answer joining the round as an
+    /// anonymous advisor). Lives inside the ordinary `answers`/`answerProviders` dictionaries, so
+    /// older builds decode these sessions unchanged — they just don't display the guest. Real seats
+    /// are 0–2; -1 is the devil's-advocate "none" sentinel; 1000 is the chair.
+    public static let guestSeatID = 99
+
+    /// The pasted guest answer for this round, if any.
+    public var guestAnswer: String? { answers[Round.guestSeatID].flatMap { $0.isEmpty ? nil : $0 } }
+    /// The guest's display name (user-supplied, shown only AFTER blind deliberation) — "Guest" default.
+    public var guestName: String { answerProviders[Round.guestSeatID] ?? "Guest" }
 
     /// Seat ids that have a non-empty answer in this round.
     public var answeredSeatIDs: Set<Int> { Set(answers.filter { !$0.value.isEmpty }.keys) }
@@ -39,6 +63,7 @@ public struct Round: Codable, Identifiable {
         case id, question, answers, peerReviews, divergence, synthesis
         case inputTokens, outputTokens, costUSD, answerProviders
         case divergenceScore, divergenceCamps, outlier, outlierSeatID, rebuttals, hadAttachment
+        case includedSeatIDs, chairSummary, chairProvider, attachedDocument
     }
     public init(question: String) { self.question = question }
     public init(from d: Decoder) throws {
@@ -59,6 +84,10 @@ public struct Round: Codable, Identifiable {
         outlierSeatID = try? c.decodeIfPresent(Int.self, forKey: .outlierSeatID)
         rebuttals = (try? c.decode([Int: String].self, forKey: .rebuttals)) ?? [:]
         hadAttachment = (try? c.decode(Bool.self, forKey: .hadAttachment)) ?? false
+        includedSeatIDs = try? c.decodeIfPresent([Int].self, forKey: .includedSeatIDs)
+        chairSummary = try? c.decodeIfPresent(String.self, forKey: .chairSummary)
+        chairProvider = try? c.decodeIfPresent(String.self, forKey: .chairProvider)
+        attachedDocument = try? c.decodeIfPresent(String.self, forKey: .attachedDocument)
     }
 }
 
@@ -77,6 +106,13 @@ public struct Session: Codable, Identifiable {
     public var decisionAt: Date? = nil
     public var outcome: String? = nil
     public var outcomeAt: Date? = nil
+    /// Outcome reminder: nudge the user to record how the decision turned out once this date passes.
+    /// In-app only (no notification permission); cleared when the outcome is logged.
+    public var remindAt: Date? = nil
+    /// Set when this decision was written into Engram (the maker's local memory app) — flips the
+    /// journal button to its "remembered" state and lets a later outcome supersede the memory.
+    public var engramMemoryID: UUID? = nil
+    public var engramRememberedAt: Date? = nil
 
     /// Text used for searching this session (title + every question + every answer + the journal).
     public var searchHaystack: String {

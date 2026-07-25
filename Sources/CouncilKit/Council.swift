@@ -235,6 +235,7 @@ public struct Council: Sendable {
         // synthesis, per-seat sampling). Persistence is gated above, so these resets don't write back.
         store.devilsAdvocateSeatID = -1       // the facade expresses devil's-advocate via the answer Persona
         store.synthesizerSeatID = -1          // auto: the first connected seat authors divergence/synthesis
+        store.chairSeat = nil                 // never inherit the app user's persisted chair (their spend!)
         guard advisors.count <= store.seats.count else { throw CouncilError.tooManyAdvisors(max: store.seats.count) }
         let seatIDs = store.seats.map(\.id)
         for (i, advisor) in advisors.enumerated() {
@@ -383,10 +384,16 @@ private final class StreamRun {
     }
 
     private func emitTokens(_ store: CouncilStore) {
-        guard let r = Council.round(store) else { return }
+        guard Council.round(store) != nil else { return }
         for seat in store.seats {
-            let full = r.answers[seat.id] ?? ""
-            let prev = emitted[seat.id] ?? ""
+            // viewedAnswer, not round.answers: while a seat streams, its partial text lives in the
+            // store's live buffer and is committed to the round only on finish. Reading the round
+            // directly turned facade streaming into one end-of-answer burst per seat.
+            let full = store.viewedAnswer(seat.id) ?? ""
+            // A transient failure makes streamCall retry the whole call, so the cumulative text can
+            // SHRINK mid-answer. Diffing the new (shorter) attempt against the old, longer emission
+            // yielded garbage tails — treat a shrink as a restart and re-emit from the top instead.
+            let prev = full.count < (emitted[seat.id] ?? "").count ? "" : (emitted[seat.id] ?? "")
             guard full.count > prev.count else { continue }
             // The engine stores the cumulative answer-so-far, so the new tail is the suffix after the
             // common prefix. commonPrefix is grapheme-aware, so a multi-scalar cluster split across SSE
