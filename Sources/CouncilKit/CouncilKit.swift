@@ -9,7 +9,7 @@ import Foundation
 /// `--version` / `--help` banner.
 public enum CouncilKit {
     /// Engine version, kept in step with the Council release line (app MARKETING_VERSION).
-    public static let version = "1.2.0"
+    public static let version = "1.3.0"
 
     /// Maintainer of CouncilKit and the Council app.
     public static let author = "Joseph"

@@ -664,4 +664,39 @@ final class CouncilKitTests: XCTestCase {
         }
         XCTAssertEqual(sessionSnapshot(), sessionsBefore, "facade wrote to the sessions directory")
     }
+
+    // MARK: - Reminder notifications (1.3)
+
+    func testScheduledRemindersOnlyForOpenLoopsInTheFuture() {
+        let now = Date()
+        func session(_ title: String, decision: String?, outcome: String?, remindAt: Date?) -> Session {
+            var s = Session(id: UUID(), title: title, createdAt: now, updatedAt: now, rounds: [], history: [:])
+            s.decision = decision; s.outcome = outcome; s.remindAt = remindAt
+            return s
+        }
+        let inAWeek = now.addingTimeInterval(7 * 86_400)
+        let yesterday = now.addingTimeInterval(-86_400)
+        let sessions = [
+            session("Berlin offer", decision: "Take it", outcome: nil, remindAt: inAWeek),        // ✓ scheduled
+            session("Already closed", decision: "Ship", outcome: "Shipped, fine", remindAt: inAWeek), // outcome logged
+            session("Came due", decision: "Wait", outcome: nil, remindAt: yesterday),           // in-app list, not a notification
+            session("No decision yet", decision: nil, outcome: nil, remindAt: inAWeek),         // nothing to remind about
+            session("No reminder", decision: "Hire", outcome: nil, remindAt: nil),
+            session("Later one", decision: "Move", outcome: "", remindAt: inAWeek.addingTimeInterval(3_600)),
+        ]
+        let scheduled = CouncilStore.scheduledReminders(in: sessions, now: now)
+        XCTAssertEqual(scheduled.map(\.line), ["Berlin offer — Take it", "Later one — Move"])   // sorted by date
+        XCTAssertEqual(scheduled.first?.at, inAWeek)
+    }
+
+    func testScheduledReminderLineIsOneShortLine() {
+        let now = Date()
+        var s = Session(id: UUID(), title: "", createdAt: now, updatedAt: now, rounds: [], history: [:])
+        s.decision = String(repeating: "decide\n", count: 40)
+        s.remindAt = now.addingTimeInterval(3_600)
+        let line = CouncilStore.scheduledReminders(in: [s], now: now).first?.line ?? ""
+        XCTAssertFalse(line.contains("\n"))
+        XCTAssertLessThanOrEqual(line.count, 120)
+        XCTAssertTrue(line.hasSuffix("…"))
+    }
 }

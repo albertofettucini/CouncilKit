@@ -107,7 +107,8 @@ public struct Session: Codable, Identifiable {
     public var outcome: String? = nil
     public var outcomeAt: Date? = nil
     /// Outcome reminder: nudge the user to record how the decision turned out once this date passes.
-    /// In-app only (no notification permission); cleared when the outcome is logged.
+    /// Mirrored into a local macOS notification when permitted (see ReminderNotifications.swift);
+    /// the in-app "outcome due" list works either way. Cleared when the outcome is logged.
     public var remindAt: Date? = nil
     /// Set when this decision was written into Engram (the maker's local memory app) — flips the
     /// journal button to its "remembered" state and lets a later outcome supersede the memory.

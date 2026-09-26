@@ -140,6 +140,12 @@ public final class CouncilStore {
     public var chairError: String?
     /// Bumped whenever a key is saved; refreshes the key cache so views re-evaluate `hasKey`.
     public var keyRevision = 0 { didSet { refreshKeyCache() } }
+    /// True when macOS notifications are switched off for Council — the journal card shows a hint
+    /// and the in-app "outcome due" list carries the reminder instead. Updated on every sync.
+    public var reminderNotificationsDenied = false
+    /// Set when the user clicks an outcome-reminder notification; the journal view consumes it (and
+    /// clears it) when it appears — so a click still lands when no window was open at the time.
+    public var pendingReminderSession: UUID? = nil
     /// Cached set of providers that currently have a key — so `hasKey`/`keyExists` never hit the
     /// Keychain from a view body (12 synchronous Keychain reads per render = the scroll jank).
     /// Rebuilt only when a key actually changes, not on every render.
@@ -400,6 +406,7 @@ public final class CouncilStore {
         }
         if Bundle.main.bundleIdentifier != nil { refreshKeyCache() }
         loadSessions()
+        syncReminderNotifications()   // journal (now loaded) → pending notifications; no-op in the CLI and tests
     }
 
     public func saveSeats() {
@@ -2079,16 +2086,27 @@ public final class CouncilStore {
     public func recordDecision(_ text: String, for id: UUID) {
         if id == currentSessionID && !sessions.contains(where: { $0.id == id }) { saveConversation() }
         updateSession(id) { $0.decision = text; $0.decisionAt = Date() }
+        syncReminderNotifications()
     }
     /// Record how a past decision turned out — closing the loop on whether the council's read held up.
     /// Logging the outcome also clears any pending reminder: the loop is closed.
     public func recordOutcome(_ text: String, for id: UUID) {
         updateSession(id) { $0.outcome = text; $0.outcomeAt = Date(); $0.remindAt = nil }
+        syncReminderNotifications()   // the loop is closed → its notification goes away
     }
 
     /// Set (or clear, with nil) the outcome reminder on a journal entry.
     public func setReminder(_ date: Date?, for id: UUID) {
+        // Whole minutes: the notification trigger has minute resolution, so the card must count the
+        // reminder as due the moment the banner fires — not 47 seconds later.
+        let date = date.map { Calendar.current.date(bySetting: .second, value: 0, of: $0) ?? $0 }
         updateSession(id) { $0.remindAt = date }
+        if date != nil {
+            // First reminder ever → macOS asks once. Later ones just re-sync.
+            Task { @MainActor in _ = await requestReminderNotificationPermission(); syncReminderNotifications() }
+        } else {
+            syncReminderNotifications()
+        }
     }
 
     /// Journal entries whose reminder has come due — decision logged, outcome still open, remindAt
@@ -2212,6 +2230,7 @@ public final class CouncilStore {
         if let url = sessionURL(id) { try? FileManager.default.removeItem(at: url) }
         sessions.removeAll { $0.id == id }
         if id == currentSessionID { newSession() }
+        syncReminderNotifications()   // a deleted decision must not ping a week later
     }
 
     /// Lowercased search text per session, built once and reused so typing in the history search
