@@ -699,4 +699,334 @@ final class CouncilKitTests: XCTestCase {
         XCTAssertLessThanOrEqual(line.count, 120)
         XCTAssertTrue(line.hasSuffix("…"))
     }
+
+    // MARK: - Read-only session: the bundled example council (0.3.1)
+
+    /// Every model call made through the store's test seam, so a test can prove what ran (and
+    /// what didn't) with no network.
+    private final class CallLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var calls: [[ChatMessage]] = []
+        func record(_ messages: [ChatMessage]) { lock.lock(); calls.append(messages); lock.unlock() }
+        var count: Int { lock.lock(); defer { lock.unlock() }; return calls.count }
+        var last: [ChatMessage]? { lock.lock(); defer { lock.unlock() }; return calls.last }
+    }
+
+    /// Answers every call at once with fixed text, and logs it.
+    private struct CannedClient: LLMClient {
+        let log: CallLog
+        let reply: String
+        func stream(messages: [ChatMessage], apiKey: String) -> AsyncThrowingStream<StreamChunk, Error> {
+            log.record(messages)
+            let reply = self.reply
+            return AsyncThrowingStream { continuation in
+                continuation.yield(.text(reply))
+                continuation.finish()
+            }
+        }
+        func validate(apiKey: String) async throws {}
+    }
+
+    /// A recorded session shaped like the bundled example: three answers and their peer reviews;
+    /// `debated` adds the debate, the verdict (outlier = seat 2) and the synthesis.
+    private func recordedSession(debated: Bool, guest: Bool = false) -> Session {
+        var r = Round(question: "Should a two-person startup adopt microservices on day one?")
+        for (id, name) in [(0, "Claude"), (1, "GPT"), (2, "Ollama")] {
+            r.answers[id] = "answer from seat \(id)"
+            r.answerProviders[id] = name
+            r.peerReviews[id] = "review by seat \(id)"
+        }
+        if debated {
+            for id in 0...2 { r.rebuttals[id] = "final take from seat \(id)" }
+            r.divergence = "## Agreement\nmostly\n\n## Divergence\nOllama differs"
+            r.divergenceScore = 92; r.divergenceCamps = 2
+            r.outlier = "Ollama"; r.outlierSeatID = 2
+            r.synthesis = "Start with a monolith."
+        }
+        if guest {
+            r.answers[Round.guestSeatID] = "a pasted outside answer"
+            r.answerProviders[Round.guestSeatID] = "ChatGPT"
+        }
+        return Session(id: UUID(), title: "Example", createdAt: Date(), updatedAt: Date(),
+                       rounds: [r], history: [:])
+    }
+
+    /// A viewer with all three seats connected (env keys) and a chair, so any mutator that slipped
+    /// past the read-only guard would really run, and be caught.
+    @MainActor private func connectedStore(persisting: Bool) -> CouncilStore {
+        let store = CouncilStore()
+        store.persistenceEnabled = false   // the chair's didSet must not write the runner's defaults
+        store.seats = [Seat(id: 0, archetype: .sage, provider: .claude),
+                       Seat(id: 1, archetype: .scientist, provider: .openAI),
+                       Seat(id: 2, archetype: .strategist, provider: .gemini)]
+        store.chairSeat = Seat(id: Seat.chairID, archetype: .sage, provider: .claude)
+        store.persistenceEnabled = persisting
+        return store
+    }
+
+    @MainActor private func sessionFilesOnDisk() -> [URL] {
+        guard let dir = CouncilStore.sessionsFolderURL,
+              let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+        else { return [] }
+        return files.filter { $0.pathExtension == "json" }
+    }
+
+    private func snapshot(_ rounds: [Round]) -> Data {
+        let e = JSONEncoder(); e.outputFormatting = [.sortedKeys]
+        return (try? e.encode(rounds)) ?? Data()
+    }
+
+    /// The example must never run, change, or land in history, whatever the app calls. Both
+    /// recordings matter: without the guards the undebated one would offer and run the debate,
+    /// divergence and synthesis, and the complete one the chair summary and guest removal.
+    @MainActor func testReadOnlyRefusesEveryMutation() async {
+        let log = CallLog()
+        CouncilStore.clientOverrideForTesting = { _ in CannedClient(log: log, reply: "a model ran") }
+        defer { CouncilStore.clientOverrideForTesting = nil }
+        let store = connectedStore(persisting: true)   // a leak would reach the (hermetic) sessions dir
+
+        for recording in [recordedSession(debated: false), recordedSession(debated: true, guest: true)] {
+            XCTAssertTrue(store.openReadOnly(recording))
+            let id = recording.id
+            let before = snapshot(store.rounds)
+            let mutators: [(String, () async -> Void)] = [
+                ("ask", { await store.ask("A follow-up question") }),
+                ("peerReview", { await store.peerReview() }),
+                ("runRebuttal", { await store.runRebuttal() }),
+                ("runChairSummary", { await store.runChairSummary() }),
+                ("runAutoPipeline", { await store.runAutoPipeline() }),
+                ("runDivergence", { await store.runDivergence() }),
+                ("runSynthesis", { await store.runSynthesis() }),
+                ("regenerate", { for s in store.seats { await store.regenerate(seatID: s.id) } }),
+                ("setDeliberationSelection", { store.setDeliberationSelection([0, 1], forRound: 0) }),
+                ("addGuestAnswer", { store.addGuestAnswer("pasted from elsewhere", name: "Gemini web") }),
+                ("removeGuestAnswer", { store.removeGuestAnswer() }),
+                ("saveConversation", { store.saveConversation() }),
+                ("recordDecision", { store.recordDecision("Stay on the monolith", for: id) }),
+                ("recordOutcome", { store.recordOutcome("It held up", for: id) }),
+                ("setReminder", { store.setReminder(Date(timeIntervalSinceNow: 86_400), for: id) }),
+                ("markRememberedInEngram", { store.markRememberedInEngram(id, memoryID: UUID()) }),
+                ("renameSession", { store.renameSession(id, to: "Renamed") }),
+            ]
+            for (name, mutate) in mutators {
+                await mutate()
+                store.flushPendingWrite()   // anything queued would be on disk now
+                XCTAssertEqual(snapshot(store.rounds), before, "\(name) changed the recording")
+                XCTAssertEqual(log.count, 0, "\(name) called a model")
+                XCTAssertTrue(store.sessions.isEmpty, "\(name) put the recording into history")
+                XCTAssertTrue(sessionFilesOnDisk().isEmpty, "\(name) wrote a session file")
+                XCTAssertTrue(store.status.values.allSatisfy { $0 == .idle }, "\(name) touched a seat")
+                XCTAssertNil(store.divergenceError, name); XCTAssertNil(store.synthesisError, name)
+                XCTAssertNil(store.chairError, name)
+                XCTAssertTrue(store.isReadOnlySession, "\(name) left read-only mode")
+                XCTAssertEqual(store.currentSession, id, name)
+                XCTAssertFalse(store.canPeerReview, "\(name): deliberation must stay unavailable")
+                XCTAssertFalse(store.canSynthesize, "\(name): deliberation must stay unavailable")
+                XCTAssertFalse(store.canRebut, "\(name): no DEBATE offer on a recording")
+            }
+        }
+    }
+
+    /// A first-run viewer has no keys, yet the recording's seats must read as having taken part.
+    @MainActor func testReadOnlyParticipantsIgnoreViewerKeys() {
+        let store = CouncilStore()
+        store.persistenceEnabled = false
+        store.seats = [Seat(id: 0, archetype: .sage), Seat(id: 1, archetype: .scientist),
+                       Seat(id: 2, archetype: .strategist)]   // nothing picked, nothing keyed
+        let recording = recordedSession(debated: true)
+
+        store.openSession(recording)
+        XCTAssertTrue(store.viewedParticipantIDs.isEmpty, "precondition: a normal session drops keyless seats")
+
+        XCTAssertTrue(store.openReadOnly(recording))
+        XCTAssertEqual(store.viewedParticipantIDs, [0, 1, 2], "a recording's seats took part, whatever keys you have")
+        for id in 0...2 { XCTAssertTrue(store.isSeatDeliberating(id), "seat \(id) must not show SAT OUT") }
+        XCTAssertFalse(store.canPeerReview, "…and still nothing can run")
+        XCTAssertEqual(store.outlierAnswer, "answer from seat 2", "the dissent card reads the recorded outlier")
+
+        // A recorded selection is still honoured: a seat that was excluded really did sit out.
+        var partial = recordedSession(debated: false)
+        partial.rounds[0].includedSeatIDs = [0, 1]
+        XCTAssertTrue(store.openReadOnly(partial))
+        XCTAssertTrue(store.isSeatDeliberating(0))
+        XCTAssertFalse(store.isSeatDeliberating(2))
+    }
+
+    @MainActor func testOpenSessionAndNewSessionLeaveReadOnly() {
+        let store = CouncilStore()
+        store.persistenceEnabled = false
+        XCTAssertFalse(store.isReadOnlySession, "a store starts writable (the CLI and the facade never change it)")
+        let recording = recordedSession(debated: true)
+        let mine = recordedSession(debated: false)   // stands in for one of the user's own sessions
+
+        store.chairFallbackNote = "Gemini couldn't run — Claude wrote this."
+        XCTAssertTrue(store.openReadOnly(recording))
+        XCTAssertTrue(store.isReadOnlySession)
+        XCTAssertEqual(store.currentSession, recording.id)
+        XCTAssertNil(store.chairFallbackNote, "a note about today's chair doesn't belong on a recording")
+
+        store.openSession(mine)
+        XCTAssertFalse(store.isReadOnlySession, "opening a real session leaves read-only")
+        XCTAssertEqual(store.currentSession, mine.id)
+
+        XCTAssertTrue(store.openReadOnly(recording))
+        store.newSession()
+        XCTAssertFalse(store.isReadOnlySession, "a new session is writable")
+        XCTAssertTrue(store.rounds.isEmpty)
+
+        // While something runs: refuse, and change nothing.
+        store.openSession(mine)
+        store.deliberationBusy = true
+        XCTAssertFalse(store.openReadOnly(recording))
+        XCTAssertFalse(store.isReadOnlySession)
+        XCTAssertEqual(store.currentSession, mine.id)
+        store.deliberationBusy = false
+    }
+
+    // MARK: - One answer isn't a council (0.3.1)
+
+    @MainActor func testSecondViewCountsStoredAnswers() {
+        let store = CouncilStore()
+        store.persistenceEnabled = false
+        store.newSession()
+        // One connected seat and two that lost their key: the state right after an update.
+        store.seats = [Seat(id: 0, archetype: .sage, provider: .claude),
+                       Seat(id: 1, archetype: .scientist), Seat(id: 2, archetype: .strategist)]
+        func needsSecondView(_ answers: [Int: String]) -> Bool {
+            var r = Round(question: "Q"); r.answers = answers
+            store.rounds = [r]; store.viewingRound = 0
+            return store.viewedRoundNeedsSecondView
+        }
+        XCTAssertFalse(needsSecondView([0: "a", 1: "b", 2: "c"]),
+                       "three stored answers are a council, whatever is connected today")
+        XCTAssertEqual(store.viewedParticipantIDs, [0], "precondition: counting participants would have said 'one'")
+        XCTAssertTrue(needsSecondView([0: "a"]), "one real answer can't be compared with anything")
+        XCTAssertTrue(needsSecondView([1: "b"]), "…also when that seat has no key today")
+        XCTAssertTrue(needsSecondView([0: "a", 1: "", 2: ""]), "empty in-progress slots are not answers")
+        XCTAssertFalse(needsSecondView([0: "a", Round.guestSeatID: "pasted"]), "one real answer plus a guest is a council of two")
+        XCTAssertFalse(needsSecondView([Round.guestSeatID: "pasted"]), "a guest alone is not a one-answer round")
+        XCTAssertFalse(needsSecondView([:]))
+
+        // An older round on screen is judged on its own answers.
+        var one = Round(question: "Q1"); one.answers = [0: "a"]
+        var three = Round(question: "Q2"); three.answers = [0: "a", 1: "b", 2: "c"]
+        store.rounds = [one, three]
+        store.viewingRound = 0; XCTAssertTrue(store.viewedRoundNeedsSecondView)
+        store.viewingRound = 1; XCTAssertFalse(store.viewedRoundNeedsSecondView)
+
+        store.rounds = [one]; store.viewingRound = 0
+        store.deliberationBusy = true
+        XCTAssertFalse(store.viewedRoundNeedsSecondView, "never while something is running")
+        store.deliberationBusy = false
+
+        var recording = recordedSession(debated: false)
+        recording.rounds[0].answers = [0: "the only answer"]
+        recording.rounds[0].peerReviews = [:]
+        XCTAssertTrue(store.openReadOnly(recording))
+        XCTAssertFalse(store.viewedRoundNeedsSecondView, "never on a read-only recording")
+    }
+
+    /// ASK {PROVIDER} TOO relies on this: regenerate fills a seat that had no answer, inside the
+    /// SAME round, without asking the first seat again.
+    @MainActor func testRegenerateFillsEmptySeatInLatestRound() async {
+        let log = CallLog()
+        CouncilStore.clientOverrideForTesting = { _ in CannedClient(log: log, reply: "a second view") }
+        defer { CouncilStore.clientOverrideForTesting = nil }
+        let store = connectedStore(persisting: false)
+        store.newSession()
+        var r = Round(question: "Should we?")
+        r.answers[0] = "the first view"; r.answerProviders[0] = "Claude"
+        store.rounds = [r]; store.viewingRound = 0
+        XCTAssertTrue(store.viewedRoundNeedsSecondView)
+        XCTAssertTrue(store.latestRoundAnswered(0))
+        XCTAssertFalse(store.latestRoundAnswered(1))
+
+        await store.regenerate(seatID: 1)
+
+        XCTAssertEqual(store.rounds.count, 1, "filled in the same round, not a round 2")
+        XCTAssertEqual(store.rounds[0].answers[1], "a second view")
+        XCTAssertEqual(store.rounds[0].answerProviders[1], LLMProvider.openAI.panelName)
+        XCTAssertEqual(store.rounds[0].answers[0], "the first view", "the first seat is not asked again")
+        XCTAssertEqual(log.count, 1, "exactly one model call, for the new seat")
+        XCTAssertEqual(log.last?.last?.text, "Should we?", "it is asked the round's own question")
+        XCTAssertTrue(store.latestRoundAnswered(1))
+        XCTAssertFalse(store.viewedRoundNeedsSecondView)
+        XCTAssertTrue(store.canPeerReview, "two answers: the round can now be compared")
+        XCTAssertEqual(store.status[1], .idle)
+    }
+
+    @MainActor func testLatestRoundHasAnalysis() {
+        let store = CouncilStore()
+        store.persistenceEnabled = false
+        store.newSession()
+        XCTAssertFalse(store.latestRoundHasAnalysis, "no rounds, no analysis")
+        var plain = Round(question: "Q"); plain.answers = [0: "a", 1: "b"]
+        store.rounds = [plain]
+        XCTAssertFalse(store.latestRoundHasAnalysis, "answers alone are not analysis")
+        var reviewed = plain; reviewed.peerReviews[0] = "a critique"
+        store.rounds = [reviewed]
+        XCTAssertTrue(store.latestRoundHasAnalysis)
+        var synthesized = plain; synthesized.synthesis = "the synthesis"
+        store.rounds = [synthesized]
+        XCTAssertTrue(store.latestRoundHasAnalysis)
+        // About the LATEST round, whichever one is on screen.
+        store.rounds = [reviewed, plain]; store.viewingRound = 0
+        XCTAssertFalse(store.latestRoundHasAnalysis)
+        XCTAssertTrue(store.latestRoundAnswered(1))
+        XCTAssertFalse(store.latestRoundAnswered(2))
+    }
+
+    // MARK: - Old session files still decode (0.3.1 changed no persisted struct)
+
+    /// Session files written by earlier versions must still load, and open read-only unchanged:
+    /// a pre-1.2 file (stored history, none of the later round keys) and a 1.3.0 file in the exact
+    /// shape the bundled example was recorded in.
+    @MainActor func testOldSessionFilesStillDecodeAndOpenReadOnly() throws {
+        let dir = try XCTUnwrap(CouncilStore.sessionsFolderURL)
+        let legacyID = UUID(), recordedID = UUID()
+        let legacy = """
+        {"id":"\(legacyID.uuidString)","title":"Old","createdAt":"2026-03-01T09:00:00Z",
+         "updatedAt":"2026-03-01T09:05:00Z",
+         "rounds":[{"id":"\(UUID().uuidString)","question":"Old question","answers":{"0":"old a","1":"old b"},
+                    "peerReviews":{},"divergence":"old map","synthesis":"old synthesis",
+                    "inputTokens":10,"outputTokens":20,"costUSD":0.01,
+                    "answerProviders":{"0":"Claude","1":"GPT"}}],
+         "history":{"0":[{"role":"user","text":"Old question"},{"role":"assistant","text":"old a"}]}}
+        """
+        let recorded = """
+        {"id":"\(recordedID.uuidString)","title":"Should a two-person startup adopt microservices",
+         "createdAt":"2026-10-14T10:00:00Z","updatedAt":"2026-10-14T10:04:00Z","history":{},
+         "rounds":[{"id":"\(UUID().uuidString)","question":"Should a two-person startup adopt microservices on day one?",
+                    "answers":{"0":"a0","1":"a1","2":"a2"},"answerProviders":{"0":"Claude","1":"GPT","2":"Ollama"},
+                    "peerReviews":{"0":"p0","1":"p1","2":"p2"},"rebuttals":{"0":"r0","1":"r1","2":"r2"},
+                    "divergence":"map","divergenceScore":92,"divergenceCamps":2,"outlier":"Ollama","outlierSeatID":2,
+                    "synthesis":"synthesis","hadAttachment":false,"inputTokens":1,"outputTokens":2,"costUSD":0.02}]}
+        """
+        let legacyURL = dir.appendingPathComponent("\(legacyID.uuidString).json")
+        let recordedURL = dir.appendingPathComponent("\(recordedID.uuidString).json")
+        try Data(legacy.utf8).write(to: legacyURL)
+        try Data(recorded.utf8).write(to: recordedURL)
+
+        let store = CouncilStore()   // loads the sessions folder
+        store.persistenceEnabled = false
+        XCTAssertEqual(Set(store.sessions.map(\.id)), [legacyID, recordedID], "both old files must decode")
+        let old = try XCTUnwrap(store.sessions.first { $0.id == legacyID })
+        XCTAssertEqual(old.rounds.first?.answers[1], "old b")
+        XCTAssertTrue(old.rounds.first?.rebuttals.isEmpty ?? false)
+        XCTAssertNil(old.rounds.first?.includedSeatIDs)
+
+        store.seats = [Seat(id: 0, archetype: .sage), Seat(id: 1, archetype: .scientist),
+                       Seat(id: 2, archetype: .strategist)]
+        let example = try XCTUnwrap(store.sessions.first { $0.id == recordedID })
+        XCTAssertTrue(store.openReadOnly(example))
+        XCTAssertEqual(store.agreementScore, 92)
+        XCTAssertEqual(store.divergenceCamps, 2)
+        XCTAssertEqual(store.outlierName, "Ollama")
+        XCTAssertEqual(store.outlierAnswer, "a2")
+        XCTAssertEqual(store.viewedAnswerProvider(2), "Ollama")
+        XCTAssertTrue(store.hasRebuttalForViewedRound)
+        XCTAssertEqual(store.viewedParticipantIDs, [0, 1, 2])
+        store.flushPendingWrite()
+        XCTAssertEqual(try Data(contentsOf: recordedURL), Data(recorded.utf8), "opening it never rewrites it")
+    }
 }

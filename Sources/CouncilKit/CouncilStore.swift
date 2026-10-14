@@ -802,14 +802,16 @@ public final class CouncilStore {
     }
 
     /// The full blind set for a round's deliberation: answered keyed seats plus the guest answer,
-    /// filtered by the round's `includedSeatIDs` selection (nil = everyone deliberates).
+    /// filtered by the round's `includedSeatIDs` selection (nil = everyone deliberates). A read-only
+    /// session is a recording: its seats took part when it was made, whatever keys THIS viewer has,
+    /// so the key check is skipped there (nothing can run against it anyway).
     private func participants(in idx: Int) -> [Participant] {
         guard rounds.indices.contains(idx) else { return [] }
         let round = rounds[idx]
         let included = round.includedSeatIDs.map(Set.init)
         var out: [Participant] = []
         for seat in seats {
-            guard hasKey(seat), let a = round.answers[seat.id], !a.isEmpty else { continue }
+            guard isReadOnlySession || hasKey(seat), let a = round.answers[seat.id], !a.isEmpty else { continue }
             if let inc = included, !inc.contains(seat.id) { continue }
             out.append(Participant(id: seat.id, name: seat.provider?.panelName ?? "Advisor",
                                    answer: a, seat: seat))
@@ -836,6 +838,7 @@ public final class CouncilStore {
     /// Deliberation needs ≥2 positions on the table and ≥1 real seat to do the reviewing —
     /// "1 real advisor + the guest" is the minimum council (pressure-test a pasted answer).
     private func canDeliberate(_ idx: Int) -> Bool {
+        guard !isReadOnlySession else { return false }
         let all = participants(in: idx)
         return all.count >= 2 && all.contains { $0.seat != nil } && !anyLoading
     }
@@ -848,8 +851,12 @@ public final class CouncilStore {
         viewedRound?.peerReviews.values.contains { !$0.isEmpty } ?? false
     }
     /// One-round bounded debate: available once peer review exists, and only until it has run once
-    /// (hard cap — a single rebuttal round per round, so cost stays bounded).
-    public var canRebut: Bool { hasPeerReviewForViewedRound && !hasRebuttalForViewedRound }
+    /// (hard cap — a single rebuttal round per round, so cost stays bounded). Never on a read-only
+    /// session: this doesn't go through canDeliberate, so it needs its own gate, or the DEBATE
+    /// offer would appear on an example that has peer review but no debate.
+    public var canRebut: Bool {
+        !isReadOnlySession && hasPeerReviewForViewedRound && !hasRebuttalForViewedRound
+    }
     public var hasRebuttalForViewedRound: Bool {
         viewedRound?.rebuttals.values.contains { !$0.isEmpty } ?? false
     }
@@ -866,6 +873,29 @@ public final class CouncilStore {
         rounds.contains { !$0.answeredSeatIDs.subtracting([Round.guestSeatID]).isEmpty }
     }
 
+    // MARK: - One answer isn't a council
+
+    /// The viewed round holds exactly ONE real advisor's answer and no guest, so it can't be
+    /// deliberated; the UI explains why and offers a second view. Counted from the STORED answers,
+    /// never from today's keys: participants drop keyless seats, so a reopened three-answer session
+    /// would otherwise read as a one-answer round right after the user re-enters a single key.
+    /// False on a read-only session and while anything is generating.
+    public var viewedRoundNeedsSecondView: Bool {
+        guard !isReadOnlySession, !anyLoading, let r = viewedRound, r.guestAnswer == nil else { return false }
+        return r.answeredSeatIDs.subtracting([Round.guestSeatID]).count == 1
+    }
+
+    /// Whether the latest round already has any deliberation (peer review, debate, divergence,
+    /// synthesis or a chair summary): what adding, replacing or removing an outside answer clears.
+    public var latestRoundHasAnalysis: Bool { roundHasDeliberation(rounds.count - 1) }
+
+    /// Whether this seat has a committed, non-empty answer in the latest round. False for a seat
+    /// that had no answer there, which `regenerate(seatID:)` fills in place, in the same round.
+    public func latestRoundAnswered(_ seatID: Int) -> Bool {
+        guard let a = rounds.last?.answers[seatID] else { return false }
+        return !a.isEmpty
+    }
+
     // MARK: - Selective deliberation
 
     /// Choose which answers (by seat id, `Round.guestSeatID` included) enter this round's
@@ -873,6 +903,7 @@ public final class CouncilStore {
     /// seats that didn't answer. If the round already deliberated, its artifacts are cleared —
     /// same "nothing stale survives" rule as regenerate.
     public func setDeliberationSelection(_ ids: Set<Int>?, forRound idx: Int) {
+        guard !isReadOnlySession else { return }
         guard rounds.indices.contains(idx), !anyLoading else { return }
         if let ids {
             guard ids.count >= 2, ids.isSubset(of: rounds[idx].answeredSeatIDs) else { return }
@@ -914,6 +945,7 @@ public final class CouncilStore {
     /// Paste an external answer into the LATEST round after the fact. Deliberation artifacts (if
     /// any) are invalidated — the blind set changed — and any selection resets to "everyone".
     public func addGuestAnswer(_ text: String, name: String? = nil) {
+        guard !isReadOnlySession else { return }
         let idx = rounds.count - 1
         guard rounds.indices.contains(idx), !anyLoading else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -927,6 +959,7 @@ public final class CouncilStore {
 
     /// Remove the latest round's guest answer (and, since the blind set changed, its deliberation).
     public func removeGuestAnswer() {
+        guard !isReadOnlySession else { return }
         let idx = rounds.count - 1
         guard rounds.indices.contains(idx), !anyLoading, rounds[idx].guestAnswer != nil else { return }
         if roundHasDeliberation(idx) { invalidateDeliberation(idx) }
@@ -956,6 +989,8 @@ public final class CouncilStore {
     /// never bloats the sidebar or follow-up context.
     public func ask(_ query: String, image: ImageAttachment? = nil, document: String? = nil,
                     guest: GuestAnswer? = nil) async {
+        // A recording can't take a new question: a caller that wants one calls newSession() first.
+        guard !isReadOnlySession else { return }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         // Defend the public API: a whitespace-only document is no document, regardless of caller hygiene.
         let trimmedDoc = document?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1015,6 +1050,7 @@ public final class CouncilStore {
     /// blind set may include a pasted guest answer — it gets an Advisor label like everyone else,
     /// so reviewers can't tell it's pasted; the guest itself never reviews (it can't call a model).
     public func peerReview() async {
+        guard !isReadOnlySession else { return }
         let idx = viewingRound
         let all = participants(in: idx)
         let reviewers = all.compactMap(\.seat)
@@ -1085,6 +1121,7 @@ public final class CouncilStore {
     /// whole council landed (anonymized, so no brand bias creeps back in) and either revises or holds,
     /// briefly saying why. Hard-capped at a single round per round so cost can't run away.
     public func runRebuttal() async {
+        guard !isReadOnlySession else { return }
         let idx = viewingRound
         let all = participants(in: idx)
         let rebutters = all.compactMap(\.seat)
@@ -1171,6 +1208,7 @@ public final class CouncilStore {
     /// `round` defaults to the viewed round (a manual re-run); the debate pipeline passes its own
     /// index so a mid-run round change can't misfile the summary.
     public func runChairSummary(round idx: Int? = nil) async {
+        guard !isReadOnlySession else { return }
         let idx = idx ?? viewingRound
         guard let chair = chairSeat, hasKey(chair), rounds.indices.contains(idx),
               rounds[idx].rebuttals.values.contains(where: { !$0.isEmpty }) else { return }
@@ -1220,6 +1258,7 @@ public final class CouncilStore {
     /// automatically in pipeline order. Each stage skips itself if it already exists, so this is
     /// safe to call after a regenerate too. Cancellation (Stop) exits between stages.
     public func runAutoPipeline() async {
+        guard !isReadOnlySession else { return }
         let idx = viewingRound
         guard rounds.indices.contains(idx), canDeliberate(idx) else { return }
         if !hasPeerReviewForViewedRound, !Task.isCancelled {
@@ -1260,6 +1299,7 @@ public final class CouncilStore {
     }
 
     public func runDivergence() async {
+        guard !isReadOnlySession else { return }
         let idx = viewingRound
         guard canDeliberate(idx), rounds.indices.contains(idx) else { return }
         deliberationBusy = true
@@ -1296,6 +1336,7 @@ public final class CouncilStore {
     }
 
     public func runSynthesis() async {
+        guard !isReadOnlySession else { return }
         let idx = viewingRound
         guard canDeliberate(idx), rounds.indices.contains(idx) else { return }
         deliberationBusy = true
@@ -1318,6 +1359,7 @@ public final class CouncilStore {
 
     /// Re-run a single advisor's answer in the latest round (only when viewing it).
     public func regenerate(seatID: Int) async {
+        guard !isReadOnlySession else { return }
         let idx = rounds.count - 1
         guard idx == viewingRound, rounds.indices.contains(idx), !anyLoading,
               let seat = seats.first(where: { $0.id == seatID }), hasKey(seat) else { return }
@@ -1564,8 +1606,9 @@ public final class CouncilStore {
             guard let k = storedKey(for: provider) else { return }
             key = k
         }
-        let client = LLMClientFactory.make(for: provider, model: seat.model,
-                                           endpoint: transientCustomEndpoints[seat.id])
+        let client = Self.clientOverrideForTesting?(provider)
+            ?? LLMClientFactory.make(for: provider, model: seat.model,
+                                     endpoint: transientCustomEndpoints[seat.id])
         // Parse the RAW output — the outlier is still an anonymous label ("Advisor B"), which we
         // resolve to a seat id HERE (case-insensitively). Matching by display name later is fragile:
         // duplicate providers share a panel name, and judges drift on label casing.
@@ -1597,6 +1640,11 @@ public final class CouncilStore {
 
     public typealias StreamResult = (text: String?, input: Int, output: Int, cancelled: Bool, error: String?)
 
+    /// Test seam: when set, every model call (answers, reviews, debate, divergence, synthesis and
+    /// the verdict) goes to this client instead of the real backend, so a test can prove what ran,
+    /// and what didn't, without the network. Internal, and never set outside the test target.
+    static var clientOverrideForTesting: ((LLMProvider) -> any LLMClient)?
+
     /// Stream one model call, feeding the growing text to `onDelta`. Returns final text (nil on
     /// hard failure), token usage, and whether it was cancelled (partial text is kept on cancel).
     private func streamCall(seat: Seat, messages: [ChatMessage],
@@ -1610,9 +1658,10 @@ public final class CouncilStore {
                   !key.isEmpty else { return (nil, 0, 0, false, "API key not found.") }
             apiKey = key
         }
-        let client = LLMClientFactory.make(for: provider, model: seat.model,
-                                           temperature: seat.temperature, maxTokens: seat.maxTokens,
-                                           endpoint: transientCustomEndpoints[seat.id])
+        let client = Self.clientOverrideForTesting?(provider)
+            ?? LLMClientFactory.make(for: provider, model: seat.model,
+                                     temperature: seat.temperature, maxTokens: seat.maxTokens,
+                                     endpoint: transientCustomEndpoints[seat.id])
         // One automatic retry on a transient connection drop (flaky Wi-Fi, an SSH-tunnelled remote
         // Ollama, a brief blip). The long streaming connection is what tends to fail, so we re-run
         // from scratch once before surfacing the error — the seat stays in its loading state throughout.
@@ -1973,7 +2022,8 @@ public final class CouncilStore {
     }
 
     public func saveConversation() {
-        guard persistenceEnabled, hasSession else { return }
+        // A read-only session (the example council) must never enter history, the journal or disk.
+        guard persistenceEnabled, hasSession, !isReadOnlySession else { return }
         if currentTitle.isEmpty { currentTitle = derivedTitle }
         let prior = sessions.first { $0.id == currentSessionID }
         var s = Session(id: currentSessionID, title: currentTitle,
@@ -2084,6 +2134,7 @@ public final class CouncilStore {
 
     /// Record (or update) what the user actually decided after this council.
     public func recordDecision(_ text: String, for id: UUID) {
+        guard !isReadOnly(id) else { return }
         if id == currentSessionID && !sessions.contains(where: { $0.id == id }) { saveConversation() }
         updateSession(id) { $0.decision = text; $0.decisionAt = Date() }
         syncReminderNotifications()
@@ -2091,12 +2142,14 @@ public final class CouncilStore {
     /// Record how a past decision turned out — closing the loop on whether the council's read held up.
     /// Logging the outcome also clears any pending reminder: the loop is closed.
     public func recordOutcome(_ text: String, for id: UUID) {
+        guard !isReadOnly(id) else { return }
         updateSession(id) { $0.outcome = text; $0.outcomeAt = Date(); $0.remindAt = nil }
         syncReminderNotifications()   // the loop is closed → its notification goes away
     }
 
     /// Set (or clear, with nil) the outcome reminder on a journal entry.
     public func setReminder(_ date: Date?, for id: UUID) {
+        guard !isReadOnly(id) else { return }   // and never ask notification permission for it
         // Whole minutes: the notification trigger has minute resolution, so the card must count the
         // reminder as due the moment the banner fires — not 47 seconds later.
         let date = date.map { Calendar.current.date(bySetting: .second, value: 0, of: $0) ?? $0 }
@@ -2146,10 +2199,11 @@ public final class CouncilStore {
 
     /// Mark a journal entry as remembered in Engram (persists the marker with the session).
     public func markRememberedInEngram(_ id: UUID, memoryID: UUID) {
+        guard !isReadOnly(id) else { return }
         updateSession(id) { $0.engramMemoryID = memoryID; $0.engramRememberedAt = Date() }
     }
     private func updateSession(_ id: UUID, _ mutate: (inout Session) -> Void) {
-        guard let i = sessions.firstIndex(where: { $0.id == id }) else { return }
+        guard !isReadOnly(id), let i = sessions.firstIndex(where: { $0.id == id }) else { return }
         mutate(&sessions[i])
         haystackCache[id] = nil   // the journal text is searchable → rebuild on next search
         // Same no-trace gate as every other write path: a non-persisting store (facade, --no-save,
@@ -2177,6 +2231,7 @@ public final class CouncilStore {
     }
 
     private func apply(_ s: Session) {
+        isReadOnlySession = false   // only openReadOnly opens a session for reading
         currentSessionID = s.id
         currentTitle = s.title
         currentCreatedAt = s.createdAt
@@ -2195,9 +2250,37 @@ public final class CouncilStore {
         apply(s)
     }
 
+    // MARK: - Read-only session (the bundled example council)
+
+    /// True while the current session is open for READING only: the bundled example council,
+    /// recorded with someone else's keys. Nothing may run against it, change it, or persist it.
+    /// Every mutator refuses, deliberation reports itself unavailable, and its recorded seats count
+    /// as participants whatever keys this viewer has (so nothing shows SAT OUT). Opening any other
+    /// session, or starting a new one, clears it.
+    public private(set) var isReadOnlySession = false
+
+    /// Show a recorded session without adopting it. It never joins `sessions`, the journal or the
+    /// sessions folder, and nothing can run against it (see `isReadOnlySession`). The session being
+    /// left is flushed to disk first, like any switch. Returns false, and changes nothing, while
+    /// something is generating.
+    @discardableResult
+    public func openReadOnly(_ s: Session) -> Bool {
+        guard !anyLoading else { return false }
+        flushPendingWrite()
+        apply(s)
+        isReadOnlySession = true
+        chairFallbackNote = nil   // a note about today's chair doesn't belong on a recording
+        return true
+    }
+
+    /// True for the read-only session's own id. Journal edits for OTHER sessions still work while
+    /// the example is on screen (the Journal screen stays usable); only the example itself refuses.
+    private func isReadOnly(_ id: UUID) -> Bool { isReadOnlySession && id == currentSessionID }
+
     public func newSession() {
         guard !anyLoading else { return }
         flushPendingWrite()   // the session being left must land on disk complete
+        isReadOnlySession = false
         currentSessionID = UUID()
         currentTitle = ""
         currentCreatedAt = Date()
@@ -2213,6 +2296,7 @@ public final class CouncilStore {
     }
 
     public func renameSession(_ id: UUID, to title: String) {
+        guard !isReadOnly(id) else { return }
         let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
         if id == currentSessionID { currentTitle = t }
