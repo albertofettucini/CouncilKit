@@ -1067,6 +1067,35 @@ final class CouncilKitTests: XCTestCase {
         XCTAssertEqual(back.decision, "Ship it", "the journal fields are carried forward")
     }
 
+    /// Exports of a recording name the models it was recorded with, never this viewer's seats.
+    @MainActor func testReadOnlyExportsUseRecordedModels() {
+        let store = connectedStore(persisting: false)
+        store.seats[0].model = "viewer-claude-model"
+        store.seats[1].model = "viewer-gpt-model"
+        let recording = recordedSession(debated: true)
+
+        // Recorded models given: exports use them.
+        XCTAssertTrue(store.openReadOnly(recording, models: [0: "claude-sonnet-4-6", 1: "gpt-5.4-mini", 2: "llama3.2"]))
+        for text in [store.exportMarkdown(), store.exportDecisionMemo()] {
+            XCTAssertTrue(text.contains("`claude-sonnet-4-6`"))
+            XCTAssertTrue(text.contains("`gpt-5.4-mini`"))
+            XCTAssertTrue(text.contains("`llama3.2`"))
+            XCTAssertFalse(text.contains("viewer-"), "the viewer's model ids must not leak into a recording's export")
+        }
+
+        // No recorded models: no model tags at all, still no viewer ids.
+        XCTAssertTrue(store.openReadOnly(recording))
+        for text in [store.exportMarkdown(), store.exportDecisionMemo()] {
+            XCTAssertFalse(text.contains("viewer-"))
+            XCTAssertFalse(text.contains("`claude-sonnet-4-6`"), "models from the previous recording are cleared")
+        }
+
+        // A normal session keeps today's rule: the id shows when the seat's provider answered.
+        store.openSession(recording)
+        XCTAssertTrue(store.exportMarkdown().contains("`viewer-claude-model`"))
+        XCTAssertFalse(store.exportMarkdown().contains("`llama3.2`"))
+    }
+
     /// A write already handed to the write queue (a journal edit here) must not recreate a session
     /// file after the session was deleted.
     @MainActor func testDeletedSessionStaysDeleted() throws {

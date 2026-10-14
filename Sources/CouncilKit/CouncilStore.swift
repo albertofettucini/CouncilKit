@@ -1847,8 +1847,7 @@ public final class CouncilStore {
         for (i, round) in rounds.enumerated() where !round.answeredSeatIDs.isEmpty {
             out += "## Round \(i + 1) — \(round.question)\n\n"
             for seat in seats where !((round.answers[seat.id] ?? "").isEmpty) {
-                // Only attach the model id when this seat's current provider is the one that answered.
-                let model = (seat.provider?.panelName == round.answerProviders[seat.id]) ? " — `\(seat.model)`" : ""
+                let model = exportModelTag(seat, round)
                 out += "### \(name(round, seat.id))\(model)\(satOut(round, seat.id))\n\n\(round.answers[seat.id] ?? "")\n\n"
             }
             if let g = round.guestAnswer {
@@ -1890,6 +1889,17 @@ public final class CouncilStore {
         return flat.count <= cap ? flat : String(flat.prefix(cap)).trimmingCharacters(in: .whitespaces) + "…"
     }
 
+    /// The " — `model`" tag an export puts after a seat's name. A read-only recording uses the
+    /// model ids recorded with it (none recorded → no tag), never this viewer's seats. Otherwise the
+    /// id is attached only when this seat's current provider is the one that answered.
+    private func exportModelTag(_ seat: Seat, _ round: Round) -> String {
+        if isReadOnlySession {
+            guard let m = readOnlyModels[seat.id], !m.isEmpty else { return "" }
+            return " — `\(m)`"
+        }
+        return (seat.provider?.panelName == round.answerProviders[seat.id]) ? " — `\(seat.model)`" : ""
+    }
+
     public func exportDecisionMemo() -> String {
         guard rounds.indices.contains(viewingRound) else { return "" }
         let round = rounds[viewingRound]
@@ -1911,7 +1921,7 @@ public final class CouncilStore {
         }
         out += "## Council\n\n"
         for seat in seats where round.answers[seat.id]?.isEmpty == false {
-            let model = (seat.provider?.panelName == round.answerProviders[seat.id]) ? " — `\(seat.model)`" : ""
+            let model = exportModelTag(seat, round)
             out += "- \(name(seat.id))\(model)\(satOut(seat.id))\n"
         }
         if round.guestAnswer != nil {
@@ -2242,6 +2252,7 @@ public final class CouncilStore {
 
     private func apply(_ s: Session) {
         isReadOnlySession = false   // only openReadOnly opens a session for reading
+        readOnlyModels = [:]
         currentSessionID = s.id
         currentTitle = s.title
         currentCreatedAt = s.createdAt
@@ -2268,17 +2279,21 @@ public final class CouncilStore {
     /// as participants whatever keys this viewer has (so nothing shows SAT OUT). Opening any other
     /// session, or starting a new one, clears it.
     public private(set) var isReadOnlySession = false
+    /// Model ids recorded with the read-only session, by seat id (see `openReadOnly`).
+    private var readOnlyModels: [Int: String] = [:]
 
     /// Show a recorded session without adopting it. It never joins `sessions`, the journal or the
     /// sessions folder, and nothing can run against it (see `isReadOnlySession`). The session being
     /// left is flushed to disk first, like any switch. Returns false, and changes nothing, while
-    /// something is generating.
+    /// something is generating. `models` (seat id → model id) is what the recording was made with;
+    /// exports use it instead of this viewer's seat models (session files don't record model ids).
     @discardableResult
-    public func openReadOnly(_ s: Session) -> Bool {
+    public func openReadOnly(_ s: Session, models: [Int: String] = [:]) -> Bool {
         guard !anyLoading else { return false }
         flushPendingWrite()
         apply(s)
         isReadOnlySession = true
+        readOnlyModels = models
         chairFallbackNote = nil   // a note about today's chair doesn't belong on a recording
         return true
     }
