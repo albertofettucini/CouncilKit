@@ -1029,4 +1029,55 @@ final class CouncilKitTests: XCTestCase {
         store.flushPendingWrite()
         XCTAssertEqual(try Data(contentsOf: recordedURL), Data(recorded.utf8), "opening it never rewrites it")
     }
+
+    // MARK: - Session writes land before exit (0.3.1)
+
+    private func decodeSession(_ url: URL) throws -> Session {
+        let d = JSONDecoder(); d.dateDecodingStrategy = .iso8601
+        return try d.decode(Session.self, from: Data(contentsOf: url))
+    }
+
+    /// The CLI exits and the app quits right after flushPendingWrite, so it must not return until
+    /// the file is on disk: the queued write AND any write already handed off.
+    @MainActor func testFlushPendingWriteLandsSynchronously() throws {
+        let store = connectedStore(persisting: true)
+        store.newSession()
+        let id = store.currentSession
+        let url = try XCTUnwrap(CouncilStore.sessionsFolderURL).appendingPathComponent("\(id.uuidString).json")
+        var r = Round(question: "Q"); r.answers[0] = "first"; r.answerProviders[0] = "Claude"
+        store.rounds = [r]
+
+        store.saveConversation()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path), "precondition: the write is debounced")
+        store.flushPendingWrite()
+        // No await between the flush and the read: the file must already be there, complete.
+        XCTAssertEqual(try decodeSession(url).rounds.first?.answers[0], "first")
+
+        // A journal edit writes straight away, off the main thread. Flush waits for that too.
+        store.recordDecision("Ship it", for: id)
+        store.flushPendingWrite()
+        XCTAssertEqual(try decodeSession(url).decision, "Ship it")
+
+        // The newest edit wins.
+        store.rounds[0].answers[1] = "second"; store.rounds[0].answerProviders[1] = "GPT"
+        store.saveConversation()
+        store.flushPendingWrite()
+        let back = try decodeSession(url)
+        XCTAssertEqual(back.rounds.first?.answers[1], "second")
+        XCTAssertEqual(back.decision, "Ship it", "the journal fields are carried forward")
+    }
+
+    /// Switching to the example is a session switch: the session being left must be on disk
+    /// before it goes, and the example must never be.
+    @MainActor func testOpenReadOnlyFlushesTheSessionBeingLeft() {
+        let store = connectedStore(persisting: true)
+        store.newSession()
+        let mine = store.currentSession
+        var r = Round(question: "Q"); r.answers[0] = "a real answer"; r.answerProviders[0] = "Claude"
+        store.rounds = [r]
+        store.saveConversation()   // queued (debounced), not yet written
+        XCTAssertTrue(store.openReadOnly(recordedSession(debated: true)))
+        XCTAssertEqual(sessionFilesOnDisk().map(\.lastPathComponent), ["\(mine.uuidString).json"],
+                       "the session being left lands on disk at once; the recording never does")
+    }
 }

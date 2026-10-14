@@ -2063,20 +2063,30 @@ public final class CouncilStore {
         })
     }
 
-    /// Write any queued session immediately. Call before anything that must not lose the last edit
-    /// (quitting, switching sessions, deleting).
+    /// Write any queued session NOW, synchronously, and wait for any write already in flight. When
+    /// this returns, every session edit made so far is on disk. Call it before anything that must
+    /// not lose the last edit: quitting the app, a CLI exit, switching or deleting sessions.
+    /// (The queued write used to go to a detached task, so a process that exited right after this
+    /// call could still lose it: the CLI's last stages, or the app's final write on quit.)
     public func flushPendingWrite() {
-        guard let p = pendingWrite else { return }
-        p.task.cancel()
-        pendingWrite = nil
-        writeSessionNow(p.id)
+        if let p = pendingWrite {
+            p.task.cancel()
+            pendingWrite = nil
+            writeSessionNow(p.id)
+        }
+        Self.sessionWriteQueue.sync {}   // returns once every write handed to the queue has landed
     }
+
+    /// Every session file write goes through this one serial queue. Writes land in the order they
+    /// were made (two detached writes could finish out of order and leave the older copy on disk),
+    /// and `flushPendingWrite` can wait for whatever is still in flight.
+    private nonisolated static let sessionWriteQueue = DispatchQueue(label: "council.session-writes", qos: .utility)
 
     private func writeSessionNow(_ id: UUID) {
         guard persistenceEnabled, let s = sessions.first(where: { $0.id == id }),
               let url = sessionURL(id), let data = try? Self.sessionCoder.enc.encode(s) else { return }
         // Atomic disk write off the MainActor (Data is Sendable) so the I/O doesn't hitch the UI.
-        Task.detached(priority: .utility) { try? data.write(to: url, options: .atomic) }
+        Self.sessionWriteQueue.async { _ = try? data.write(to: url, options: .atomic) }
     }
 
     // MARK: - Decision journal (local only)

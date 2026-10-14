@@ -176,6 +176,12 @@ func run(_ opts: Options) async {
     let store = CouncilStore()
     store.persistenceEnabled = !opts.noSave
 
+    // Every exit from here on goes through these two. saveConversation only QUEUES the session's
+    // disk write (debounced, then off-thread), so a bare exit() right after the last stage used to
+    // drop peer review, divergence and synthesis from the history the app shows.
+    func finish(_ code: Int32) -> Never { store.flushPendingWrite(); exit(code) }
+    func fail(_ msg: String, code: Int32 = 2) -> Never { store.flushPendingWrite(); die(msg, code: code) }
+
     // "Verify against an existing session file before writing": if the sessions dir has files but
     // NONE decoded, our writer may not match the app's schema — don't risk corrupting history.
     if store.persistenceEnabled,
@@ -195,18 +201,18 @@ func run(_ opts: Options) async {
     if let path = opts.configPath {
         guard let data = FileManager.default.contents(atPath: (path as NSString).expandingTildeInPath),
               let config = try? JSONDecoder().decode(CouncilConfig.self, from: data)
-        else { die("couldn't read council config at \(path)") }
+        else { fail("couldn't read council config at \(path)") }
         let wasPersistent = store.persistenceEnabled
         store.persistenceEnabled = false
         store.applyConfig(config)
         store.persistenceEnabled = wasPersistent
     } else if !opts.seatNames.isEmpty {
-        guard opts.seatNames.count <= store.seats.count else { die("at most \(store.seats.count) seats", code: 64) }
+        guard opts.seatNames.count <= store.seats.count else { fail("at most \(store.seats.count) seats", code: 64) }
         let wasPersistent = store.persistenceEnabled
         store.persistenceEnabled = false
         for (i, seat) in store.seats.enumerated() {
             if i < opts.seatNames.count {
-                guard let p = provider(named: opts.seatNames[i]) else { die("unknown provider '\(opts.seatNames[i])'", code: 64) }
+                guard let p = provider(named: opts.seatNames[i]) else { fail("unknown provider '\(opts.seatNames[i])'", code: 64) }
                 store.setProvider(p, seatID: seat.id)
             } else {
                 store.clearProvider(seatID: seat.id)
@@ -217,7 +223,7 @@ func run(_ opts: Options) async {
 
     // --chair is TRANSIENT, like --seats: moderate this run without persisting as the app's chair.
     if let cname = opts.chairName {
-        guard let p = provider(named: cname) else { die("unknown provider '\(cname)' for --chair", code: 64) }
+        guard let p = provider(named: cname) else { fail("unknown provider '\(cname)' for --chair", code: 64) }
         let wasPersistent = store.persistenceEnabled
         store.persistenceEnabled = false
         store.setChair(p)
@@ -229,7 +235,7 @@ func run(_ opts: Options) async {
 
     let connected = store.seats.filter { store.hasKey($0) }
     guard !connected.isEmpty else {
-        die("no seats configured — use --seats claude,gpt,gemini or --config lineup.council\n       (cloud providers also need: council keys set <provider>)", code: 64)
+        fail("no seats configured — use --seats claude,gpt,gemini or --config lineup.council\n       (cloud providers also need: council keys set <provider>)", code: 64)
     }
     for seat in store.seats where seat.provider != nil && !store.hasKey(seat) {
         errPrint("warning: \(seat.provider!.displayName) has no API key (council keys set …) — seat skipped")
@@ -241,17 +247,17 @@ func run(_ opts: Options) async {
     var document: String?
     if let path = opts.filePath {
         guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else {
-            die("can't read --file \(path)")
+            fail("can't read --file \(path)")
         }
         let doc = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !doc.isEmpty else { die("--file \(path) is empty") }
-        if let err = CouncilLimits.documentError(doc) { die(err) }
+        guard !doc.isEmpty else { fail("--file \(path) is empty") }
+        if let err = CouncilLimits.documentError(doc) { fail(err) }
         document = doc
         errPrint(Style.dim("attached \(doc.count)-char document from \(path)"))
     } else if isatty(0) == 0 {
         let data = FileHandle.standardInput.readDataToEndOfFile()
         if let doc = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !doc.isEmpty {
-            if let err = CouncilLimits.documentError(doc) { die(err) }
+            if let err = CouncilLimits.documentError(doc) { fail(err) }
             document = doc
             errPrint(Style.dim("attached \(doc.count)-char document from stdin"))
         }
@@ -260,20 +266,20 @@ func run(_ opts: Options) async {
     var guest: GuestAnswer?
     if let path = opts.guestPath {
         guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else {
-            die("can't read --guest \(path)")
+            fail("can't read --guest \(path)")
         }
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { die("--guest \(path) is empty") }
-        if let err = CouncilLimits.guestError(text) { die(err) }
+        guard !text.isEmpty else { fail("--guest \(path) is empty") }
+        if let err = CouncilLimits.guestError(text) { fail(err) }
         guest = GuestAnswer(name: opts.guestName, text: text)
         errPrint(Style.dim("guest answer: \(text.count) chars — joins blind review anonymously"))
     } else if opts.guestName != nil {
-        die("--guest-name needs --guest <path>", code: 64)
+        fail("--guest-name needs --guest <path>", code: 64)
     }
 
     // A document alone is a valid run — the engine synthesizes "Analyze the attached document."
     let question = opts.question
-    guard !question.isEmpty || document != nil else { die("no question given (see --help)", code: 64) }
+    guard !question.isEmpty || document != nil else { fail("no question given (see --help)", code: 64) }
 
     let payloadMode = opts.json || opts.md          // keep stdout clean for machine output
     func stage(_ s: String) { errPrint(Style.dim("· \(s)…")) }
@@ -293,7 +299,7 @@ func run(_ opts: Options) async {
             if case .failed(let m) = store.status[seat.id] ?? .idle { return "\(seat.provider?.panelName ?? "seat"): \(m)" }
             return nil
         }
-        die("no advisor answered" + (errs.isEmpty ? "" : "\n       " + errs.joined(separator: "\n       ")))
+        fail("no advisor answered" + (errs.isEmpty ? "" : "\n       " + errs.joined(separator: "\n       ")))
     }
     func name(_ seatID: Int) -> String {
         round()?.answerProviders[seatID] ?? store.seats.first { $0.id == seatID }?.provider?.panelName ?? "Advisor"
@@ -320,12 +326,12 @@ func run(_ opts: Options) async {
         var ids = Set<Int>()
         for n in names {
             if n == "guest" {
-                guard round()?.guestAnswer != nil else { die("--deliberate names 'guest' but no --guest was given", code: 64) }
+                guard round()?.guestAnswer != nil else { fail("--deliberate names 'guest' but no --guest was given", code: 64) }
                 ids.insert(Round.guestSeatID)
             } else if let p = provider(named: n), let seat = store.seats.first(where: { $0.provider == p }) {
                 ids.insert(seat.id)
             } else {
-                die("--deliberate: '\(n)' is not in the lineup", code: 64)
+                fail("--deliberate: '\(n)' is not in the lineup", code: 64)
             }
         }
         store.setDeliberationSelection(ids, forRound: store.viewingRound)
@@ -406,7 +412,7 @@ func run(_ opts: Options) async {
         let memo = store.exportDecisionMemo()
         if let out = opts.mdOut {
             do { try memo.write(toFile: (out as NSString).expandingTildeInPath, atomically: true, encoding: .utf8) }
-            catch { die("couldn't write \(out): \(error.localizedDescription)") }
+            catch { fail("couldn't write \(out): \(error.localizedDescription)") }
             errPrint("wrote \(out)")
         } else {
             print(memo)
@@ -464,15 +470,15 @@ func run(_ opts: Options) async {
 
     // CI gate — distinct from runtime errors: missing verdict is a runtime error (can't gate on it).
     if let gate = opts.failAbove {
-        guard let agreement = store.agreementScore else { die("--fail-above set but no divergence verdict was produced") }
+        guard let agreement = store.agreementScore else { fail("--fail-above set but no divergence verdict was produced") }
         let displayed = 100 - agreement
         if displayed > gate {
             errPrint("divergence \(displayed) exceeds gate \(gate) — failing")
-            exit(1)
+            finish(1)
         }
         errPrint(Style.dim("divergence \(displayed) within gate \(gate)"))
     }
-    exit(0)
+    finish(0)
 }
 
 // MARK: - Entry
