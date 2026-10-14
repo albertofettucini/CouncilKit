@@ -2321,7 +2321,11 @@ public final class CouncilStore {
         if id == currentSessionID && anyLoading { return }
         // Drop any queued write for this session, or it would recreate the file after deletion.
         if let p = pendingWrite, p.id == id { p.task.cancel(); pendingWrite = nil }
-        if let url = sessionURL(id) { try? FileManager.default.removeItem(at: url) }
+        // Remove on the write queue, so a write already handed to it (a rename, a journal edit, a
+        // flush) lands first and can't recreate the file after it's gone.
+        if let url = sessionURL(id) {
+            Self.sessionWriteQueue.sync { try? FileManager.default.removeItem(at: url) }
+        }
         sessions.removeAll { $0.id == id }
         if id == currentSessionID { newSession() }
         syncReminderNotifications()   // a deleted decision must not ping a week later

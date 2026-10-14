@@ -1067,6 +1067,26 @@ final class CouncilKitTests: XCTestCase {
         XCTAssertEqual(back.decision, "Ship it", "the journal fields are carried forward")
     }
 
+    /// A write already handed to the write queue (a journal edit here) must not recreate a session
+    /// file after the session was deleted.
+    @MainActor func testDeletedSessionStaysDeleted() throws {
+        let store = connectedStore(persisting: true)
+        store.newSession()
+        let id = store.currentSession
+        let url = try XCTUnwrap(CouncilStore.sessionsFolderURL).appendingPathComponent("\(id.uuidString).json")
+        var r = Round(question: "Q"); r.answers[0] = "first"; r.answerProviders[0] = "Claude"
+        store.rounds = [r]
+        store.saveConversation()
+        store.flushPendingWrite()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), "precondition: the session is on disk")
+
+        store.recordDecision("Ship it", for: id)   // an immediate write, queued off the main thread
+        store.deleteSession(id)
+        store.flushPendingWrite()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path), "a queued write must land before the delete, not after")
+        XCTAssertFalse(store.sessions.contains { $0.id == id })
+    }
+
     /// Switching to the example is a session switch: the session being left must be on disk
     /// before it goes, and the example must never be.
     @MainActor func testOpenReadOnlyFlushesTheSessionBeingLeft() {
