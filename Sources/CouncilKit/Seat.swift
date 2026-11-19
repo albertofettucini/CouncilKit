@@ -40,7 +40,9 @@ public struct Seat: Identifiable, Codable {
         archetype = (try? c.decode(Archetype.self, forKey: .archetype)) ?? .sage
         provider = try c.decodeIfPresent(LLMProvider.self, forKey: .provider)
         let savedModel = try c.decodeIfPresent(String.self, forKey: .model)
-        model = (savedModel?.isEmpty == false) ? savedModel! : (provider?.defaultModel ?? "")
+        let chosen = (savedModel?.isEmpty == false) ? savedModel! : (provider?.defaultModel ?? "")
+        // A seat saved with a model its provider has since switched off moves to the replacement.
+        model = provider?.current(chosen) ?? chosen
         systemPrompt = try c.decodeIfPresent(String.self, forKey: .systemPrompt)
         temperature = try c.decodeIfPresent(Double.self, forKey: .temperature)
         maxTokens = try c.decodeIfPresent(Int.self, forKey: .maxTokens)

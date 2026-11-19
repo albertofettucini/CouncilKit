@@ -230,13 +230,39 @@ public enum LLMProvider: String, CaseIterable, Identifiable, Codable {
         }
     }
 
+    /// Model ids a provider no longer serves under that name, and the id that answers in its place
+    /// (checked against each provider's own documentation, November 2026).
+    static let retiredModels: [LLMProvider: [String: String]] = [
+        // DeepSeek ended both names on 2026-07-24. Since April they had only pointed at V4 Flash
+        // (without and with thinking), which `deepseek-flash` now serves.
+        .deepSeek: ["deepseek-chat": "deepseek-flash", "deepseek-reasoner": "deepseek-flash"],
+        // xAI retired its Grok 4 fast models on 2026-05-15 and answers their names with grok-4.3.
+        .grok: ["grok-4-fast-reasoning": "grok-4.3", "grok-4.1-fast": "grok-4.3"],
+        // Google now answers requests for gemini-3.5-flash with gemini-3.6-flash.
+        .gemini: ["gemini-3.5-flash": "gemini-3.6-flash"],
+        // Perplexity removed sonar-reasoning in December 2025 and points to the pro model.
+        .perplexity: ["sonar-reasoning": "sonar-reasoning-pro"],
+        // OpenRouter lists this model with a dot in the version.
+        .openRouter: ["anthropic/claude-sonnet-4-6": "anthropic/claude-sonnet-4.6"],
+    ]
+
+    /// The id to call for a saved model: itself, unless the provider no longer serves that name,
+    /// in which case the id that answers in its place. A seat still set to a retired id fails on
+    /// every question (or is quietly answered by another model), so saved seats and imported
+    /// lineups pass through here when they load. An id the user types is kept as typed until the
+    /// next launch, when the saved seat passes through here like any other; what a session already
+    /// recorded is never rewritten.
+    public func current(_ model: String) -> String {
+        Self.retiredModels[self]?[model.lowercased()] ?? model
+    }
+
     /// Default model id per provider. These move fast — update here if an API rejects the name.
     public var defaultModel: String {
         switch self {
         case .claude:           return "claude-sonnet-4-6"
         case .openAI:           return "gpt-5.4-mini"
-        case .gemini:           return "gemini-3.5-flash"
-        case .deepSeek:         return "deepseek-chat"
+        case .gemini:           return "gemini-3.6-flash"
+        case .deepSeek:         return "deepseek-flash"
         case .grok:             return "grok-4.3"
         case .mistral:          return "mistral-large-latest"
         case .perplexity:       return "sonar"
@@ -253,16 +279,18 @@ public enum LLMProvider: String, CaseIterable, Identifiable, Codable {
     /// so an outdated list never blocks them.
     public var modelOptions: [String] {
         switch self {
-        case .claude:           return ["claude-fable-5", "claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"]
-        case .openAI:           return ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
-        case .gemini:           return ["gemini-3.5-pro", "gemini-3.5-flash"]
-        case .deepSeek:         return ["deepseek-chat", "deepseek-reasoner"]
-        case .grok:             return ["grok-4.3", "grok-4.1-fast", "grok-4-fast-reasoning"]
-        case .mistral:          return ["mistral-large-latest", "mistral-medium-latest", "mistral-small-latest"]
-        case .perplexity:       return ["sonar", "sonar-pro", "sonar-reasoning"]
-        case .openRouter:       return ["openai/gpt-5.4", "anthropic/claude-sonnet-4-6",
-                                        "google/gemini-3.5-pro", "deepseek/deepseek-chat",
-                                        "meta-llama/llama-4-70b-instruct"]
+        case .claude:           return ["claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
+                                        "claude-sonnet-4-6"]
+        case .openAI:           return ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-luna", "gpt-5.5", "gpt-5.4-mini"]
+        case .gemini:           return ["gemini-4-carbon", "gemini-4-hydrogen", "gemini-3.8-flash", "gemini-3.6-flash",
+                                        "gemini-3.5-flash-lite"]
+        case .deepSeek:         return ["deepseek-flash", "deepseek-v4-pro"]
+        case .grok:             return ["grok-4.7", "grok-4.6", "grok-4.3"]
+        case .mistral:          return ["mistral-large-latest", "mistral-small-latest"]
+        case .perplexity:       return ["sonar", "sonar-pro", "sonar-reasoning-pro"]
+        case .openRouter:       return ["openai/gpt-5.4-mini", "openai/gpt-6.2-sol", "anthropic/claude-sonnet-5.5",
+                                        "google/gemini-4-hydrogen", "deepseek/deepseek-v4.1-flash",
+                                        "meta-llama/llama-4-maverick"]
         case .ollama:           return ["llama3.2", "llama3.3", "qwen2.5", "deepseek-r1", "gemma3", "mistral", "phi4"]
         case .foundationModels: return ["on-device"]
         case .custom1, .custom2: return ["default"]

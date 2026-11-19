@@ -6,8 +6,9 @@
 
 <p align="center">
   <b>Multi-model deliberation as a Swift primitive.</b><br>
-  Put one question to several LLMs, let them critique each other blind, and get back a decision —
-  with a disagreement score and the dissenting view surfaced.<br>
+  Put one question to several LLMs, let them critique each other blind, and get back what they
+  settled and what is still yours to decide — with a disagreement score and the dissenting view
+  surfaced.<br>
   Because one model gives you one model's blind spots.
 </p>
 
@@ -33,7 +34,7 @@ the engine behind [Council](https://github.com/albertofettucini/Council) — now
 Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/albertofettucini/CouncilKit.git", .upToNextMinor(from: "0.1.0"))
+.package(url: "https://github.com/albertofettucini/CouncilKit.git", .upToNextMinor(from: "0.3.2"))
 ```
 
 Then `import CouncilKit`. **Pre-1.0** — the API may change before 1.0, so pin to an exact minor
@@ -55,7 +56,7 @@ let result = try await council.deliberate(
     "Should a two-person startup adopt microservices on day one?"
 )
 
-print(result.synthesis ?? "")        // decision-ready distillation
+print(result.synthesis ?? "")        // what settled, what you still decide, where they split
 print(result.divergence?.score ?? 0) // 0–100: how far apart they landed
 print(result.dissent?.answer ?? "")  // the outlier's full case, if there is one
 ```
@@ -65,7 +66,7 @@ outlier kept visible so the majority can't quietly be wrong together.
 
 ## What you get back
 
-- `synthesis` — a decision-ready distillation of where the council netted out.
+- `synthesis` — a map of what the council settled, what you still have to decide (the open trade-offs and the strongest dissent), and where they diverged. It recommends nothing: the decision stays yours.
 - `divergence` — a 0–100 read of how far apart the answers landed, the camps that formed, who the outlier is, and the written analysis. It measures agreement, not correctness.
 - `dissent` — the outlier's full answer, on its own, because consensus isn't proof.
 - `answers` — every advisor's original answer and the blind critique it wrote.
@@ -85,11 +86,15 @@ for await event in council.stream("…") {
     case .advisorFailed(let advisor, let error): break  // an advisor dropped out (non-terminal)
     case .critique(let advisor, let text): break  // blind peer review
     case .divergence(let report):          break  // report.score / .camps / .outlier / .analysis
-    case .synthesis(let text):             break  // final distillation
+    case .synthesis(let text):             break  // what settled, what is still yours to decide
     case .failure(let error):              break  // setup / no-answer failure (terminal)
     }
 }
 ```
+
+`stream` has no event for an answer that was cut off or stalled: its tokens arrive, and it then sits
+out of the review and the score. If you need to know, use `deliberate`, where each answer carries a
+`status`.
 
 ## Backends — bring your own keys
 

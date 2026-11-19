@@ -26,17 +26,40 @@ public struct ChatMessage: Sendable, Codable {
     public static func assistant(_ t: String) -> ChatMessage { .init(role: .assistant, text: t) }
 }
 
-/// A streamed piece of a response: a text delta, or the final token usage.
+/// A streamed piece of a response: a text delta, the final token usage, why the response ended, or
+/// a sign that the provider is still working.
 public enum StreamChunk: Sendable {
     case text(String)
     case usage(input: Int, output: Int)
+    /// Why the response ended, as far as the provider says. Sent at most once, as soon as it is
+    /// known; a backend that can't say (Apple on-device) sends none, which reads as `.unknown`.
+    case stop(StopReason)
+    /// The stream is alive, but this piece carries nothing to keep: a model thinking before it
+    /// answers, a ping, a keep-alive. It tells the stall watchdog not to give up and is otherwise
+    /// ignored. Without it a model that reasons for two minutes before its first word looks hung.
+    case heartbeat
+
+    /// Why a response ended, reduced to what the engine acts on.
+    public enum StopReason: Sendable, Equatable {
+        /// The model finished on its own (Anthropic `end_turn` / `stop_sequence`, OpenAI `stop`).
+        case finished
+        /// Cut off at the length limit: the max-tokens cap, or the model's context window.
+        case lengthLimit
+        /// The response stopped short: a provider that always marks its end didn't, or it reported
+        /// an error finish. What arrived is kept, but it is not the whole answer.
+        case endedEarly
+        /// No usable reason. Shows no marker: a custom server that sends no reason must never make
+        /// every answer look cut off.
+        case unknown
+    }
 }
 
 /// A uniform interface over every LLM backend. Each provider has its own wire format
 /// under the hood, but callers only ever see these methods. `Sendable` so the streaming pump can
 /// run OFF the MainActor (all conformers are small value types).
 public protocol LLMClient: Sendable {
-    /// Token-by-token stream. Yields text deltas as they arrive, then a usage chunk.
+    /// Token-by-token stream. Yields text deltas as they arrive, a stop chunk once the provider says
+    /// why it ended, then a usage chunk.
     func stream(messages: [ChatMessage], apiKey: String) -> AsyncThrowingStream<StreamChunk, Error>
     /// Cheap key check: makes a tiny authenticated call. Returns normally if the key
     /// works, throws a clear `LLMError` if it's invalid / out of balance / unusable.

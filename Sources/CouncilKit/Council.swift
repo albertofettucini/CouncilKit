@@ -13,7 +13,8 @@ import Foundation
 // API keys come from the macOS Keychain by default (zero config), or directly in code via
 // `Advisor(apiKey:)` / `Council(keyProvider:)`. A facade call LEAVES NO TRACE: it runs on its own
 // non-persisting store and writes nothing to disk, UserDefaults, or the Keychain — direct keys and
-// custom endpoints are held in memory only, for that call.
+// custom endpoints are held in memory only, for that call. Nor does it read the Council app's saved
+// history: its store starts empty, even inside the app's own process.
 
 /// The model provider behind an advisor (Claude, GPT, Gemini, DeepSeek, Grok, Mistral, Perplexity,
 /// OpenRouter, Ollama, on-device, or a custom OpenAI-compatible endpoint). Alias of the engine's
@@ -43,7 +44,7 @@ public enum Persona: Sendable {
         }
     }
 
-    private static let devilsAdvocatePrompt = """
+    static let devilsAdvocatePrompt = """
     You are the council's devil's advocate. Argue the strongest case AGAINST the obvious or popular \
     answer: surface the overlooked risks, the failure modes, and the best case for the opposite \
     conclusion. Be specific and intellectually honest — if the popular view genuinely holds, say \
@@ -82,7 +83,8 @@ public enum DeliberationEvent: Sendable {
     case critique(advisor: String, text: String)
     /// The divergence verdict — score, camps, outlier, and the narrative.
     case divergence(DeliberationResult.Divergence)
-    /// The final decision-ready synthesis.
+    /// The synthesis: what the council settled, what you still have to decide, and where they
+    /// diverged. It maps the decision and recommends nothing.
     case synthesis(String)
     /// Setup or no-answer failure (the streamed equivalent of `deliberate(...)` throwing). Terminal.
     case failure(CouncilError)
@@ -95,6 +97,18 @@ public struct DeliberationResult: Sendable {
         public let backend: String
         public let text: String
         public let peerReview: String?
+        /// How the answer ended. Anything but `.complete` means `text` is only the part that
+        /// arrived (cut off at the length limit, stopped responding, or stopped): such an answer
+        /// sits out of peer review, divergence and synthesis. Reported here only — `stream(...)`
+        /// has no event for it.
+        public let status: AnswerStatus
+
+        init(backend: String, text: String, peerReview: String?, status: AnswerStatus = .complete) {
+            self.backend = backend
+            self.text = text
+            self.peerReview = peerReview
+            self.status = status
+        }
     }
     /// How far apart the council landed — `score` 0 (identical) … 100 (poles apart) — plus how many
     /// camps formed, which advisor was the outlier, and the human-readable analysis. Measures
@@ -116,8 +130,8 @@ public struct DeliberationResult: Sendable {
     public struct Cost: Sendable { public let usd: Double; public let inputTokens: Int; public let outputTokens: Int }
 
     public let answers: [Answer]
-    public let synthesis: String?              // nil unless at least two advisors answered
-    public let divergence: Divergence?         // nil unless at least two advisors answered
+    public let synthesis: String?              // nil unless at least two advisors finished their answers
+    public let divergence: Divergence?         // nil unless at least two advisors finished their answers
     public let dissent: Dissent?               // nil if there was no clear outlier
     public let failedAdvisors: [FailedAdvisor] // advisors that errored; empty if all answered
     public let cost: Cost
@@ -173,12 +187,14 @@ public struct Council: Sendable {
 
     /// Put one question to the whole council and run the full pipeline
     /// (answers → blind peer review → divergence → synthesis). Optionally attach a document every
-    /// advisor reads first. Nothing is persisted.
+    /// advisor reads first; peer review reads it too when it is at most
+    /// `CouncilLimits.maxStoredAttachmentCharacters` long. Nothing is persisted.
     ///
     /// Tolerant of partial failure: advisors that error (no key / network / provider failure) are
-    /// dropped and listed in `result.failedAdvisors`; the run proceeds over the rest. Peer review /
-    /// divergence / synthesis run only when at least two advisors answered — otherwise `synthesis` and
-    /// `divergence` are `nil`. Throws `.missingAPIKeys` if no advisor has a key, `.noAdvisorAnswered`
+    /// dropped and listed in `result.failedAdvisors`; the run proceeds over the rest. An answer that
+    /// ended early is kept with its `status` but sits out of the deliberation. Peer review /
+    /// divergence / synthesis run only when at least two advisors finished their answers — otherwise
+    /// `synthesis` and `divergence` are `nil`. Throws `.missingAPIKeys` if no advisor has a key, `.noAdvisorAnswered`
     /// if every advisor errored.
     public func deliberate(_ question: String, document: String? = nil) async throws -> DeliberationResult {
         try await Self.runDeliberation(advisors, question: question, document: document,
@@ -224,7 +240,7 @@ public struct Council: Sendable {
                                 keyProvider: (@Sendable (Backend) -> String?)? = nil,
                                 pricing: PriceProvider? = nil) throws -> CouncilStore {
         guard !advisors.isEmpty else { throw CouncilError.noAdvisors }
-        let store = CouncilStore()
+        let store = CouncilStore(loadHistory: false)   // never reads the app's saved history, even in the app
         store.persistenceEnabled = false      // a library call never touches the app's saved history or lineup
         store.refreshKeyCache()               // warm the Keychain cache (the app does this on launch; a
                                               // fresh store's `hasKey` would otherwise read empty)
@@ -292,7 +308,8 @@ public struct Council: Sendable {
         let answers: [DeliberationResult.Answer] = store.seats.compactMap { seat in
             guard let text = r?.answers[seat.id], !text.isEmpty else { return nil }
             let review = r?.peerReviews[seat.id].flatMap { $0.isEmpty ? nil : $0 }
-            return .init(backend: advisorName(store, seat), text: text, peerReview: review)
+            return .init(backend: advisorName(store, seat), text: text, peerReview: review,
+                         status: r?.answerStatuses[seat.id] ?? .complete)
         }
         let dissent: DeliberationResult.Dissent? = {
             guard let name = store.outlierName, let ans = store.outlierAnswer, !ans.isEmpty else { return nil }

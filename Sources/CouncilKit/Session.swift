@@ -1,5 +1,24 @@
 import Foundation
 
+/// How one seat's answer ended, recorded on its round when the answer finishes. The raw values are
+/// the file format, so a case is never renamed. Rounds saved before 1.3.2 record none: a seat with
+/// no recorded status counts as complete, so old sessions and the bundled example show no marker.
+public enum AnswerStatus: String, CaseIterable, Codable, Sendable {
+    /// The model finished the answer on its own.
+    case complete
+    /// Cut off at the length limit (the seat's max tokens, or the model's context window).
+    case truncated
+    /// Stopped responding partway through: the stall watchdog fired, or the stream ended early.
+    case stalled
+    /// The user stopped it before it finished.
+    case cancelled
+    /// The call failed: the seat has no answer in this round.
+    case failed
+
+    /// The answer ended early: whatever text arrived is kept, but it is not the whole answer.
+    public var isIncomplete: Bool { self == .truncated || self == .stalled || self == .cancelled }
+}
+
 /// One deliberation round: a question, each advisor's answer, their peer reviews, and the
 /// (optional) divergence + synthesis generated for THIS round. Each round keeps its own
 /// analyses, so asking a follow-up never wipes an earlier round's work.
@@ -44,6 +63,16 @@ public struct Round: Codable, Identifiable {
     /// Which provider actually chaired this round — the Settings chair can change afterwards, and
     /// a summary must keep naming the model that wrote it.
     public var chairProvider: String? = nil
+    /// How each seat's answer ended (seat id → status). Empty on every round saved before 1.3.2;
+    /// a seat with no entry counts as complete.
+    public var answerStatuses: [Int: AnswerStatus] = [:]
+    /// The model id each seat's answer actually came from (seat id → model), recorded with the
+    /// answer, so an export still names the right model after the seat switches models.
+    public var answerModels: [Int: String] = [:]
+    /// `CouncilKit.promptVersion` when the round was asked. nil on rounds saved before 1.3.2.
+    public var promptVersion: Int? = nil
+    /// When the round was asked. nil on rounds saved before 1.3.2 — never filled in with a guess.
+    public var createdAt: Date? = nil
 
     /// Reserved seat id for a pasted GUEST answer (an external AI's answer joining the round as an
     /// anonymous advisor). Lives inside the ordinary `answers`/`answerProviders` dictionaries, so
@@ -59,13 +88,41 @@ public struct Round: Codable, Identifiable {
     /// Seat ids that have a non-empty answer in this round.
     public var answeredSeatIDs: Set<Int> { Set(answers.filter { !$0.value.isEmpty }.keys) }
 
+    /// Seat ids whose kept answer ended early (cut off, stalled or stopped). A seat with no
+    /// recorded status counts as complete, so a round saved before 1.3.2 has none.
+    public var incompleteSeatIDs: Set<Int> {
+        answeredSeatIDs.filter { answerStatuses[$0]?.isIncomplete == true }
+    }
+
+    /// The short label exports, the decision memo and the CLI put next to a seat's name: why its
+    /// kept answer is incomplete, or that a seat that was asked kept no answer. nil for a whole
+    /// answer, and for a seat with no recorded status (a round saved before 1.3.2, the guest, or
+    /// a seat still answering), so those show nothing.
+    public func statusLabel(_ seatID: Int) -> String? {
+        guard let status = answerStatuses[seatID] else { return nil }
+        guard answers[seatID]?.isEmpty == false else { return "did not answer" }
+        switch status {
+        case .complete, .failed: return nil
+        case .truncated: return "incomplete: cut off at the length limit"
+        case .stalled: return "incomplete: stopped responding"
+        case .cancelled: return "incomplete: stopped"
+        }
+    }
+
     public enum CodingKeys: String, CodingKey {
         case id, question, answers, peerReviews, divergence, synthesis
         case inputTokens, outputTokens, costUSD, answerProviders
         case divergenceScore, divergenceCamps, outlier, outlierSeatID, rebuttals, hadAttachment
         case includedSeatIDs, chairSummary, chairProvider, attachedDocument
+        case answerStatuses, answerModels, promptVersion, createdAt
     }
-    public init(question: String) { self.question = question }
+    /// `createdAt` and `promptVersion` stay nil unless given: the store passes both when it asks a
+    /// new round, so a value is only ever recorded, never assumed.
+    public init(question: String, createdAt: Date? = nil, promptVersion: Int? = nil) {
+        self.question = question
+        self.createdAt = createdAt
+        self.promptVersion = promptVersion
+    }
     public init(from d: Decoder) throws {
         let c = try d.container(keyedBy: CodingKeys.self)
         id = (try? c.decode(UUID.self, forKey: .id)) ?? UUID()
@@ -88,6 +145,12 @@ public struct Round: Codable, Identifiable {
         chairSummary = try? c.decodeIfPresent(String.self, forKey: .chairSummary)
         chairProvider = try? c.decodeIfPresent(String.self, forKey: .chairProvider)
         attachedDocument = try? c.decodeIfPresent(String.self, forKey: .attachedDocument)
+        // Read as raw strings: a status from a newer build drops only its own entry, never the map.
+        answerStatuses = ((try? c.decodeIfPresent([Int: String].self, forKey: .answerStatuses)) ?? [:])
+            .compactMapValues(AnswerStatus.init(rawValue:))
+        answerModels = (try? c.decodeIfPresent([Int: String].self, forKey: .answerModels)) ?? [:]
+        promptVersion = try? c.decodeIfPresent(Int.self, forKey: .promptVersion)
+        createdAt = try? c.decodeIfPresent(Date.self, forKey: .createdAt)
     }
 }
 

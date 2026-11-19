@@ -37,6 +37,14 @@ public enum CouncilLimits {
     /// first token — but it is settable for tighter environments (CI).
     public static var stallTimeoutSeconds: Double = 90
 
+    /// How long a seat may show signs of life without adding a word to its answer before the
+    /// council stops waiting for it. A model that thinks first sends pings and thinking events,
+    /// and those keep the stall limit above from firing; this is the bound for one that never
+    /// gets to the answer (a queue that only sends keep-alives, a server that pings forever).
+    /// Without it such a seat would hold the round until someone pressed Stop, and the CLI has no
+    /// Stop. Ten minutes is far longer than a model needs to start answering a council question.
+    public static var thinkingTimeoutSeconds: Double = 600
+
     /// How much of an attached document a round keeps so it can be re-asked identically. Sessions
     /// are plain JSON on disk and every save re-encodes the whole thing, so a 100k-character
     /// document in every round would make history heavy; past this size the round keeps only the
@@ -68,14 +76,23 @@ actor FlushGate {
     func waitUntilIdle() async { while busy { await Task.yield() } }
 }
 
-/// Liveness clock for one streaming call, so a watchdog can tell "slow" from "hung": every chunk
-/// touches it, and the watchdog only fires when nothing has arrived for the stall limit.
+/// Liveness clocks for one streaming call, so a watchdog can tell "slow" from "hung". Every chunk
+/// touches the first, and the watchdog fires when nothing at all has arrived for the stall limit.
+/// Only a chunk that moves the answer on (text, usage, an end signal) touches the second, so a
+/// call that sends signs of life and nothing else is still bounded, by the thinking limit.
 actor StreamLiveness {
     private var last = DispatchTime.now().uptimeNanoseconds
+    private var lastProgress = DispatchTime.now().uptimeNanoseconds
     private(set) var timedOut = false
-    func touch() { last = DispatchTime.now().uptimeNanoseconds }
+    /// The watchdog fired on the thinking limit: signs of life kept coming, the answer did not.
+    private(set) var stillWorking = false
+    func touch(progress: Bool) {
+        last = DispatchTime.now().uptimeNanoseconds
+        if progress { lastProgress = last }
+    }
     func idleNanos() -> UInt64 { DispatchTime.now().uptimeNanoseconds &- last }
-    func markTimedOut() { timedOut = true }
+    func stuckNanos() -> UInt64 { DispatchTime.now().uptimeNanoseconds &- lastProgress }
+    func markTimedOut(stillWorking: Bool = false) { timedOut = true; self.stillWorking = stillWorking }
 }
 
 /// What one stream attempt produced. Sendable, so the pump can run as its own task and be raced
@@ -86,11 +103,14 @@ struct PumpOutcome: Sendable {
     var input = 0
     var output = 0
     var failure: PumpFailure?
+    /// Why the provider said the response ended; nil when it said nothing before the stream ended.
+    /// `.lengthLimit` with no failure is a cut-off answer: the text is kept, it is not an error.
+    var stop: StreamChunk.StopReason?
 }
 
 enum PumpFailure: Sendable {
     case cancelled              // the user pressed Stop — keep whatever streamed, no error
-    case stalled(String)        // produced nothing for too long; do NOT retry a wedged backend
+    case stalled(String)        // went quiet, or the stream ended early; do NOT retry a wedged backend
     case transient(String)      // a connection blip — worth exactly one automatic retry
     case permanent(String)
 }
@@ -138,6 +158,11 @@ public final class CouncilStore {
     /// Same contract for the chair's post-debate summary: a failed call must be visible, not a
     /// silently missing card after the UI promised "+1 chair summary".
     public var chairError: String?
+    /// Same contract for peer review and the debate, one line per seat whose review (or final take)
+    /// didn't finish: it is never saved, and the seat's ANSWER keeps its own status — a review that
+    /// failed is not an answer that failed.
+    public var peerReviewError: String?
+    public var rebuttalError: String?
     /// Bumped whenever a key is saved; refreshes the key cache so views re-evaluate `hasKey`.
     public var keyRevision = 0 { didSet { refreshKeyCache() } }
     /// True when macOS notifications are switched off for Council — the journal card shows a hint
@@ -262,8 +287,21 @@ public final class CouncilStore {
     }
 
     /// The Council app's own bundle id — the one process allowed to turn off macOS Keychain dialogs
-    /// process-wide (see KeychainStore.suppressSystemPrompts).
+    /// process-wide (see KeychainStore.suppressSystemPrompts), and the one that reads the saved
+    /// history at construction (see `init(loadHistory:)`).
     static let appBundleID = "com.joseph.Council"
+
+    /// Whether a store built without an explicit `loadHistory` reads the saved history: only in the
+    /// Council app itself. An exact match, because "has a bundle id" is not enough: the test runner,
+    /// a fork and any app embedding CouncilKit all have one.
+    static func loadsHistoryAutomatically(bundleID: String?) -> Bool {
+        bundleID == appBundleID
+    }
+
+    /// Test seam: the bundle id the history gate sees instead of the running process's, so a test
+    /// can stand in for the app (or a foreign host) without being one. Internal, and never set
+    /// outside the test target. Nothing else reads it: Keychain handling still sees the real id.
+    static var hostBundleIDForTesting: String?
 
     private let seatsKey = "council.seats.v7"   // v7: ship default divergence personas
     private static let promptKey = "council.systemPrompt"
@@ -298,7 +336,7 @@ public final class CouncilStore {
     and intellectually honest, never contrarian just for show. Concise, in your own voice.
     """
 
-    private static let peerReviewPrompt = """
+    static let peerReviewPrompt = """
     You are one of several AI advisors on a council and you have already given your own answer. \
     Below are the other advisors' answers to the same question, anonymized. Review them critically: \
     state clearly where you AGREE and where you DISAGREE, and why. If one of them changed your mind, \
@@ -306,7 +344,7 @@ public final class CouncilStore {
     consensus just to agree. Be concise, honest, and in your own voice.
     """
 
-    private static let adversaryReviewPrompt = """
+    static let adversaryReviewPrompt = """
     You are the council's Devil's Advocate. Your job is NOT to find agreement — it is to stress-test \
     the emerging consensus. First steelman the position the other advisors seem to share: state it in \
     its strongest, fairest form. Then attack it — surface the strongest objections, the overlooked \
@@ -315,7 +353,7 @@ public final class CouncilStore {
     to be true for it to be wrong. Do NOT soften your critique just to be agreeable.
     """
 
-    private static let divergencePrompt = """
+    static let divergencePrompt = """
     You are the council's analyst. You are given the advisors' answers to a question. Map the \
     deliberation in two clearly-headed markdown sections: "## Agreement" (points most or all advisors \
     share) and "## Divergence" (where they disagree — name which advisor holds which view, and why). \
@@ -330,7 +368,7 @@ public final class CouncilStore {
     /// Divergence + verdict in ONE call, for backends that can be trusted to keep a strict tail
     /// (see `LLMProvider.supportsMergedVerdict`). Same narrative contract as `divergencePrompt`,
     /// plus the JSON `verdictPrompt` would otherwise ask for in a second pass over the same context.
-    private static let divergenceWithVerdictPrompt = """
+    static let divergenceWithVerdictPrompt = """
     You are the council's analyst. You are given the advisors' answers to a question. Map the \
     deliberation in two clearly-headed markdown sections: "## Agreement" (points most or all advisors \
     share) and "## Divergence" (where they disagree — name which advisor holds which view, and why). \
@@ -344,21 +382,25 @@ public final class CouncilStore {
 
     /// Tiny structured-verdict prompt, run as a SEPARATE json-mode call (reliable even on small local
     /// models) so the score never depends on a free-form line the model might drop.
-    private static let verdictPrompt = """
+    static let verdictPrompt = """
     You are a meticulous judge. Given the advisors' answers, output ONLY a JSON object and nothing else:
     {"agreement": <integer 0-100, how much they agree on the bottom-line conclusion>, "camps": <integer number of distinct positions>, "outlier": <the single advisor label most apart, e.g. "Advisor B", or null>}
     Agreement measures consensus, not correctness.
     """
 
-    private static let synthesisPrompt = """
-    You are the council's synthesizer. Given the advisors' answers, produce a \
-    final synthesis in markdown with two parts: a clear, decisive recommended answer first; then a \
-    section "## Where they diverged" that explicitly preserves the dissent — note where advisors \
-    disagreed and why, without flattening it into false consensus. The human decides: give them a \
-    clear map, not a command.
+    static let synthesisPrompt = """
+    You are the council's synthesizer. Given the advisors' answers, produce a final synthesis in \
+    markdown with three parts: first a section "## What the council settled" — the points the \
+    advisors genuinely share, naming who agrees on each (if nothing is settled, say so); then a \
+    section "## What you still have to decide" — the open trade-offs the answers leave to the human, \
+    and the strongest dissent; then a section "## Where they diverged" that explicitly preserves the \
+    dissent — note where advisors disagreed and why, without flattening it into false consensus. Do \
+    not pick a winner or add a recommendation of your own. Write out every advisor's label in full, \
+    even in a list ("Advisor A and Advisor B", never "Advisors A and B"). The human decides: give \
+    them a clear map, not a command.
     """
 
-    private static let chairSummaryPrompt = """
+    static let chairSummaryPrompt = """
     You are the council's neutral chair. You did not answer the question yourself and you hold no \
     position. Given the advisors' original answers and their final takes after debate, write a short \
     neutral map of the debate in markdown: who moved and why, who held and why, and which single \
@@ -367,7 +409,172 @@ public final class CouncilStore {
     advisor. Be concise.
     """
 
-    public init() {
+    // MARK: Stage request templates
+    //
+    // The user-message text each stage wraps around its live inputs. It lives here, next to the
+    // stage briefs, so every fixed word the engine sends to a model is in one place, and in the
+    // prompt catalog below.
+
+    /// The question a round records when the user typed none and attached only a document or an image.
+    static let documentOnlyQuestion = "Analyze the attached document."
+    static let imageOnlyQuestion = "Describe and assess this image."
+
+    /// A question with its attached document folded in, as every seat receives it. The round itself
+    /// saves only the question.
+    static func documentPrompt(_ question: String, document: String) -> String {
+        "\(question)\n\n--- ATTACHED DOCUMENT ---\n\n\(document)"
+    }
+
+    /// What a peer review can show of the attachment the round's answers were written with.
+    enum ReviewAttachment {
+        /// No attachment in this round or any earlier one.
+        case none
+        /// The round's own kept document (see `CouncilLimits.maxStoredAttachmentCharacters`).
+        case document(String)
+        /// The round had an attachment Council didn't keep: an image, or a document over the limit.
+        case notKept
+        /// The round has no attachment, but an earlier round in the session did.
+        case notInThisRound
+    }
+
+    /// A reviewer's system message: the seat's own persona, then the review brief. The brief goes
+    /// last so the stage instruction wins where the two pull apart.
+    static func reviewerSystemPrompt(persona: String, brief: String) -> String {
+        "\(persona)\n\n\(brief)"
+    }
+
+    /// Peer review: the question as the council was asked it, with the round's document (or a
+    /// plain note when the reviewer can't see an attachment the answers had, or had in an earlier
+    /// round), then the reviewer's own answer and the other positions, anonymized.
+    static func peerReviewRequest(question: String, attachment: ReviewAttachment,
+                                  ownAnswer: String, others: String) -> String {
+        let asked: String
+        switch attachment {
+        case .none:
+            asked = question
+        case .document(let document):
+            // Same fold as the answers got. The answers follow, so the document's end is marked.
+            asked = documentPrompt(question, document: document) + "\n\n--- END OF DOCUMENT ---"
+        case .notKept:
+            asked = question + "\n\nNote: the advisors answered with an attachment (an image or a long "
+                + "document) that is not included here, so don't assume what it contains."
+        case .notInThisRound:
+            asked = question + "\n\nNote: a document or image attached to an earlier question is not in "
+                + "this round. The advisors answered without it and it is not included here, so don't "
+                + "assume what it contains."
+        }
+        return """
+        The council was asked:
+
+        \(asked)
+
+        Your own answer was:
+
+        \(ownAnswer)
+
+        The other advisors answered the same question as follows:
+
+        \(others)
+
+        Review their answers: where do you agree, where do you disagree, and would you refine your own answer? Be specific.
+        """
+    }
+
+    /// The debate round: the question, the seat's own answer, and where the others landed.
+    static func rebuttalRequest(question: String, ownAnswer: String, others: String) -> String {
+        """
+        The council was asked:
+
+        \(question)
+
+        Your earlier answer:
+
+        \(ownAnswer)
+
+        Here is where the other advisors landed (anonymized):
+
+        \(others)
+
+        Reconsider in light of the disagreement. If another position exposes a real weakness in \
+        yours, revise — and say what changed and why. If you still hold your position, say so and \
+        give the strongest reason it survives the critique. Be decisive; this is your final take.
+        """
+    }
+
+    /// What divergence, its verdict and synthesis all read: the question and every position, anonymized.
+    static func analysisRequest(question: String, answers: String) -> String {
+        "Question:\n\(question)\n\nThe advisors' answers (anonymized):\n\n\(answers)"
+    }
+
+    /// One advisor's part of the debate transcript the chair reads, under its real name. A nil
+    /// `finalTake` means it took no part in the debate round.
+    static func chairDebateBlock(name: String, firstSaid: String, finalTake: String?) -> String {
+        var b = "\(name) first said:\n\(firstSaid)"
+        if let finalTake {
+            b += "\n\n\(name)'s final take after debate:\n\(finalTake)"
+        } else {
+            // Never let silence read as "held its position": the guest is a static paste and a
+            // seat may simply have failed. Say which it is, and the prompt forbids guessing.
+            b += "\n\n\(name) did not take part in the debate round, so it has no final take."
+        }
+        return b
+    }
+
+    /// The chair's request: the question, then every advisor's block.
+    static func chairSummaryRequest(question: String, blocks: [String]) -> String {
+        "The council was asked:\n\(question)\n\nThe debate:\n\n\(blocks.joined(separator: "\n\n---\n\n"))"
+    }
+
+    /// Every fixed text the engine sends to a model, by name: the default advisor prompt and
+    /// personas, the facade's devil's advocate, the stage briefs, the verdict sentinel, and the
+    /// request templates above, rendered with {placeholders} where live text goes. The tests pin a
+    /// SHA-256 of each entry for the current `CouncilKit.promptVersion`, plus the full transcript of
+    /// a scripted round (which also covers the blind-label blocks and how each stage assembles its
+    /// messages). Change any of this text and the version moves with it.
+    static var promptCatalog: [(name: String, text: String)] {
+        [
+            ("defaultSystemPrompt", defaultSystemPrompt),
+            ("personaAnalyst", personaAnalyst),
+            ("personaPractitioner", personaPractitioner),
+            ("personaSkeptic", personaSkeptic),
+            ("facadeDevilsAdvocatePersona", Persona.devilsAdvocatePrompt),
+            ("peerReviewPrompt", peerReviewPrompt),
+            ("adversaryReviewPrompt", adversaryReviewPrompt),
+            ("divergencePrompt", divergencePrompt),
+            ("divergenceWithVerdictPrompt", divergenceWithVerdictPrompt),
+            ("verdictPrompt", verdictPrompt),
+            ("verdictSentinel", verdictSentinel),
+            ("synthesisPrompt", synthesisPrompt),
+            ("chairSummaryPrompt", chairSummaryPrompt),
+            ("documentOnlyQuestion", documentOnlyQuestion),
+            ("imageOnlyQuestion", imageOnlyQuestion),
+            ("documentPrompt", documentPrompt("{question}", document: "{document}")),
+            ("reviewerSystemPrompt", reviewerSystemPrompt(persona: "{persona}", brief: "{review brief}")),
+            ("peerReviewRequest", peerReviewRequest(question: "{question}", attachment: .none,
+                                                    ownAnswer: "{own answer}", others: "{other answers}")),
+            ("peerReviewRequestWithDocument", peerReviewRequest(question: "{question}", attachment: .document("{document}"),
+                                                                ownAnswer: "{own answer}", others: "{other answers}")),
+            ("peerReviewRequestAttachmentNotKept", peerReviewRequest(question: "{question}", attachment: .notKept,
+                                                                     ownAnswer: "{own answer}", others: "{other answers}")),
+            ("peerReviewRequestAttachmentNotInThisRound", peerReviewRequest(question: "{question}", attachment: .notInThisRound,
+                                                                            ownAnswer: "{own answer}", others: "{other answers}")),
+            ("rebuttalRequest", rebuttalRequest(question: "{question}", ownAnswer: "{own answer}",
+                                                others: "{other answers}")),
+            ("analysisRequest", analysisRequest(question: "{question}", answers: "{answers}")),
+            ("chairDebateBlock", chairDebateBlock(name: "{name}", firstSaid: "{answer}", finalTake: "{final take}")),
+            ("chairDebateBlockWithoutFinalTake", chairDebateBlock(name: "{name}", firstSaid: "{answer}", finalTake: nil)),
+            ("chairSummaryRequest", chairSummaryRequest(question: "{question}", blocks: ["{block}", "{block}"])),
+        ]
+    }
+
+    /// A store with the saved seat lineup and roles.
+    ///
+    /// - Parameter loadHistory: whether to read the saved sessions and open the newest one. Leave
+    ///   it nil and only the Council app does (its exact bundle id); every other host (the `council`
+    ///   CLI, the `Council` facade, tests, an app embedding CouncilKit) starts with an empty
+    ///   `sessions` list and a fresh session. A fork built under another bundle id passes `true` to
+    ///   keep its history; anyone else can call `loadSessions()` deliberately.
+    public init(loadHistory: Bool? = nil) {
         if let data = UserDefaults.standard.data(forKey: seatsKey),
            let saved = try? JSONDecoder().decode([Seat].self, from: data), saved.count == 3 {
             seats = saved
@@ -405,8 +612,16 @@ public final class CouncilStore {
             KeychainStore.suppressSystemPrompts()
         }
         if Bundle.main.bundleIdentifier != nil { refreshKeyCache() }
-        loadSessions()
-        syncReminderNotifications()   // journal (now loaded) → pending notifications; no-op in the CLI and tests
+        // Reading history is the app's job. A non-app process used to decode the user's whole
+        // sessions folder (another app's container, for the CLI) and briefly hold their newest
+        // session as its own, just to throw it away. The reminder sync describes that loaded
+        // journal, so it sits behind the same gate.
+        let readsHistory = loadHistory
+            ?? Self.loadsHistoryAutomatically(bundleID: Self.hostBundleIDForTesting ?? Bundle.main.bundleIdentifier)
+        if readsHistory {
+            loadSessions()
+            syncReminderNotifications()   // journal (now loaded) → pending notifications; no-op in tests
+        }
     }
 
     public func saveSeats() {
@@ -447,7 +662,10 @@ public final class CouncilStore {
         for i in seats.indices {
             if let sc = config.seats.indices.contains(i) ? config.seats[i] : nil {
                 seats[i].provider = sc.provider
-                seats[i].model = sc.model.isEmpty ? (sc.provider?.defaultModel ?? "") : sc.model
+                // A shared lineup can be older than a provider's current models: a retired id
+                // moves to its replacement, as it does for a saved seat.
+                let chosen = sc.model.isEmpty ? (sc.provider?.defaultModel ?? "") : sc.model
+                seats[i].model = sc.provider?.current(chosen) ?? chosen
                 seats[i].systemPrompt = sc.systemPrompt
                 // Clamp imported sampling through the same bounds as the manual setters, so a
                 // hand-edited/malicious file can't set e.g. maxTokens: 100000000 or temperature: 9.
@@ -471,7 +689,7 @@ public final class CouncilStore {
         // all four bundled presets) leaves the user's chair alone — silently unseating a paid
         // moderator because a shared lineup predates the feature is a change nobody asked for.
         if let cc = config.chair, let p = cc.provider {
-            setChair(p, model: cc.model.isEmpty ? nil : cc.model)
+            setChair(p, model: cc.model.isEmpty ? nil : p.current(cc.model))
         }
         saveSeats()
         keyRevision += 1
@@ -642,8 +860,11 @@ public final class CouncilStore {
     public func prevRound() { if canGoPrevRound { viewingRound -= 1; clearDeliberationErrors() } }
     public func nextRound() { if canGoNextRound { viewingRound += 1; clearDeliberationErrors() } }
 
-    /// Drop the transient divergence/synthesis errors (they belong to one attempt on one round).
-    public func clearDeliberationErrors() { divergenceError = nil; synthesisError = nil; chairError = nil }
+    /// Drop the transient deliberation errors (they belong to one attempt on one round).
+    public func clearDeliberationErrors() {
+        divergenceError = nil; synthesisError = nil; chairError = nil
+        peerReviewError = nil; rebuttalError = nil
+    }
 
     private var viewedRound: Round? { rounds.indices.contains(viewingRound) ? rounds[viewingRound] : nil }
     public var viewedQuestion: String { viewedRound?.question ?? "" }
@@ -668,6 +889,10 @@ public final class CouncilStore {
     /// Provider name recorded for this seat's answer in the viewed round (for the panel title when
     /// the seat itself is currently unassigned, e.g. a reopened session).
     public func viewedAnswerProvider(_ seatID: Int) -> String? { viewedRound?.answerProviders[seatID] }
+    /// How this seat's answer in the viewed round ended, as recorded. nil while it is still
+    /// streaming (a status is recorded only when the answer finishes; regenerate clears the old
+    /// one), and for a round saved before 1.3.2, which counts as complete.
+    public func viewedAnswerStatus(_ seatID: Int) -> AnswerStatus? { viewedRound?.answerStatuses[seatID] }
     /// Read-only views of the current round's cross-model artifacts (used by the UI).
     public var divergenceText: String? { liveDivergence ?? viewedRound?.divergence }
     public var synthesisText: String? { liveSynthesis ?? viewedRound?.synthesis }
@@ -697,16 +922,19 @@ public final class CouncilStore {
     public var agreementScore: Int? { viewedRound?.divergenceScore }
     public var divergenceCamps: Int? { viewedRound?.divergenceCamps }
     public var outlierName: String? { viewedRound?.outlier }
-    /// The outlier advisor's own answer for the viewed round — for Dissent. Prefers the seat id
-    /// resolved at verdict time; falls back to panel-name matching for sessions saved before that.
-    public var outlierAnswer: String? {
+    /// The seat whose answer Dissent spotlights in the viewed round, so a surface can also say how
+    /// that answer ended. Prefers the seat id resolved at verdict time; falls back to panel-name
+    /// matching for sessions saved before that. nil when the outlier has no answer here.
+    public var dissentSeatID: Int? {
         guard let round = viewedRound else { return nil }
-        if let sid = round.outlierSeatID, let a = round.answers[sid], !a.isEmpty { return a }
+        if let sid = round.outlierSeatID, round.answers[sid]?.isEmpty == false { return sid }
         guard let name = round.outlier,
               let sid = round.answerProviders.first(where: { $0.value == name })?.key,
-              let a = round.answers[sid], !a.isEmpty else { return nil }
-        return a
+              round.answers[sid]?.isEmpty == false else { return nil }
+        return sid
     }
+    /// The outlier advisor's own answer for the viewed round — for Dissent.
+    public var outlierAnswer: String? { dissentSeatID.flatMap { viewedRound?.answers[$0] } }
     public var hasDissent: Bool { outlierAnswer != nil }
 
     /// Session token + cost totals (sum across rounds) — an estimate.
@@ -900,15 +1128,18 @@ public final class CouncilStore {
 
     /// Choose which answers (by seat id, `Round.guestSeatID` included) enter this round's
     /// deliberation. nil = everyone (the default). Rejects selections smaller than 2 or naming
-    /// seats that didn't answer. If the round already deliberated, its artifacts are cleared —
-    /// same "nothing stale survives" rule as regenerate.
+    /// seats that didn't answer — except one that only adds to a smaller selection: when every
+    /// answer ended early, the default selection is empty, and the way back is one answer at a time.
+    /// If the round already deliberated, its artifacts are cleared — same "nothing stale survives"
+    /// rule as regenerate.
     public func setDeliberationSelection(_ ids: Set<Int>?, forRound idx: Int) {
         guard !isReadOnlySession else { return }
         guard rounds.indices.contains(idx), !anyLoading else { return }
-        if let ids {
-            guard ids.count >= 2, ids.isSubset(of: rounds[idx].answeredSeatIDs) else { return }
-        }
         let current = rounds[idx].includedSeatIDs.map(Set.init)
+        if let ids {
+            let growsSmallSelection = current.map { $0.count < 2 && $0.isStrictSubset(of: ids) } ?? false
+            guard ids.count >= 2 || growsSmallSelection, ids.isSubset(of: rounds[idx].answeredSeatIDs) else { return }
+        }
         guard current != ids else { return }
         if roundHasDeliberation(idx) { invalidateDeliberation(idx) }
         rounds[idx].includedSeatIDs = ids.map { Array($0).sorted() }
@@ -937,13 +1168,14 @@ public final class CouncilStore {
         rounds[idx].synthesis = nil
         rounds[idx].chairSummary = nil
         rounds[idx].chairProvider = nil
-        divergenceError = nil; synthesisError = nil; chairError = nil
+        clearDeliberationErrors()
     }
 
     // MARK: - Guest seat
 
     /// Paste an external answer into the LATEST round after the fact. Deliberation artifacts (if
-    /// any) are invalidated — the blind set changed — and any selection resets to "everyone".
+    /// any) are invalidated — the blind set changed — and any selection resets to the default:
+    /// everyone, less any answer that ended early.
     public func addGuestAnswer(_ text: String, name: String? = nil) {
         guard !isReadOnlySession else { return }
         let idx = rounds.count - 1
@@ -954,6 +1186,7 @@ public final class CouncilStore {
         rounds[idx].includedSeatIDs = nil
         rounds[idx].answers[Round.guestSeatID] = trimmed
         rounds[idx].answerProviders[Round.guestSeatID] = Self.guestDisplayName(name)
+        excludeIncompleteAnswersByDefault(idx)
         saveConversation()
     }
 
@@ -966,6 +1199,7 @@ public final class CouncilStore {
         rounds[idx].includedSeatIDs = nil
         rounds[idx].answers[Round.guestSeatID] = nil
         rounds[idx].answerProviders[Round.guestSeatID] = nil
+        excludeIncompleteAnswersByDefault(idx)
         saveConversation()
     }
 
@@ -997,14 +1231,16 @@ public final class CouncilStore {
         let doc = (trimmedDoc?.isEmpty == false) ? trimmedDoc : nil
         guard !trimmed.isEmpty || image != nil || doc != nil else { return }
         let question = trimmed.isEmpty
-            ? (doc != nil ? "Analyze the attached document." : "Describe and assess this image.")
+            ? (doc != nil ? Self.documentOnlyQuestion : Self.imageOnlyQuestion)
             : trimmed
         // The document is folded into the prompt every seat receives, but NOT saved as the question.
-        let effectivePrompt = doc.map { "\(question)\n\n--- ATTACHED DOCUMENT ---\n\n\($0)" } ?? question
+        let effectivePrompt = doc.map { Self.documentPrompt(question, document: $0) } ?? question
 
         let keyed = seats.filter { hasKey($0) }
         guard !keyed.isEmpty else { return }
-        var round = Round(question: question)
+        // Only a NEW round gets a time and a prompt version: a round decoded from an older file
+        // keeps nil for both instead of a made-up one.
+        var round = Round(question: question, createdAt: Date(), promptVersion: CouncilKit.promptVersion)
         round.hadAttachment = (image != nil || doc != nil)   // see Round.hadAttachment — gates Regenerate
         // Keep a modest document so Regenerate can re-ask the SAME question later. An image is
         // never kept (size), so an image round still can't be regenerated.
@@ -1042,13 +1278,15 @@ public final class CouncilStore {
                 }
             }
         }
+        excludeIncompleteAnswersByDefault(idx)
         generatingRound = nil
         saveConversation()
     }
 
-    /// Round 2: each advisor reviews the other POSITIONS (anonymized) for the VIEWED round. The
-    /// blind set may include a pasted guest answer — it gets an Advisor label like everyone else,
-    /// so reviewers can't tell it's pasted; the guest itself never reviews (it can't call a model).
+    /// Round 2: each advisor reviews the other POSITIONS (anonymized) for the VIEWED round, in its
+    /// own persona, with the question and the round's kept document. The blind set may include a
+    /// pasted guest answer — it gets an Advisor label like everyone else, so reviewers can't tell
+    /// it's pasted; the guest itself never reviews (it can't call a model).
     public func peerReview() async {
         guard !isReadOnlySession else { return }
         let idx = viewingRound
@@ -1056,61 +1294,58 @@ public final class CouncilStore {
         let reviewers = all.compactMap(\.seat)
         guard all.count >= 2, !reviewers.isEmpty, rounds.indices.contains(idx) else { return }
         let names = uniqueNames(for: all.map { (id: $0.id, base: $0.name) })
+        let question = rounds[idx].question
+        let attachment = reviewAttachment(idx)
         deliberationBusy = true
         generatingRound = idx
         pipelineStage = "Peer review"
+        peerReviewError = nil
         for s in reviewers { status[s.id] = .loading; rounds[idx].peerReviews[s.id] = "" }
         // Re-running peer review invalidates the rebuttal round (and any chair summary of it) that
         // followed the OLD reviews — clear them so DEBATE unlocks again instead of showing stale takes.
         rounds[idx].rebuttals.removeAll()
         rounds[idx].chairSummary = nil
 
-        await withTaskGroup(of: Void.self) { group in
+        let unfinished = await withTaskGroup(of: (Int, StreamResult)?.self) { group -> [Int: StreamResult] in
             for seat in reviewers {
                 let myAnswer = rounds[idx].answers[seat.id] ?? ""
                 // Blind the reviewer with anonymous labels (no brand bias), but keep a map back
                 // to real names so the READER sees "I disagree with Gemini", not "Advisor B".
                 // Shuffled per reviewer so no position (e.g. the guest) sits at a fixed letter.
-                let others = all.filter { $0.id != seat.id }.shuffled()
-                var remap: [String: String] = [:]
-                let othersText = others.enumerated().map { i, p -> String in
-                    let label = "Advisor \(String(UnicodeScalar(65 + i)!))"
-                    remap[label] = names[p.id] ?? "Advisor"
-                    return "\(label) said:\n\(p.answer)"
-                }.joined(separator: "\n\n")
-                let reviewText = """
-                Your own answer was:
-
-                \(myAnswer)
-
-                The other advisors answered the same question as follows:
-
-                \(othersText)
-
-                Review their answers: where do you agree, where do you disagree, and would you refine your own answer? Be specific.
-                """
-                // The devil's advocate gets an adversarial brief instead of the standard reviewer one.
-                let reviewSystem = (seat.id == devilsAdvocateSeatID) ? Self.adversaryReviewPrompt : Self.peerReviewPrompt
+                let others = blindPositions(all, excluding: seat.id, heading: " said:")
+                let reviewText = Self.peerReviewRequest(question: question, attachment: attachment,
+                                                        ownAnswer: myAnswer, others: others.text)
+                // The seat reviews in its own persona (as set now: a round doesn't record the one
+                // it answered with). The devil's advocate gets an adversarial brief instead of the
+                // standard reviewer one.
+                let brief = (seat.id == devilsAdvocateSeatID) ? Self.adversaryReviewPrompt : Self.peerReviewPrompt
+                let reviewSystem = Self.reviewerSystemPrompt(persona: systemPrompt(for: seat), brief: brief)
                 let messages = [ChatMessage.system(reviewSystem), .user(reviewText)]
                 group.addTask { @MainActor in
                     let r = await self.streamCall(seat: seat, messages: messages) { partial in
                         self.livePeerReviews[seat.id] = partial   // raw buffer — no rounds churn per tick
                     }
                     self.livePeerReviews[seat.id] = nil
-                    guard self.rounds.indices.contains(idx) else { return }
-                    if let text = r.text, !r.cancelled {
-                        self.rounds[idx].peerReviews[seat.id] = self.deAnonymize(text, remap)
-                        self.status[seat.id] = .idle
-                        self.addRoundUsage(idx, seat, r)
-                    } else if r.cancelled {
-                        self.status[seat.id] = .idle
-                    } else {
-                        self.rounds[idx].peerReviews[seat.id] = nil
-                        self.status[seat.id] = .failed(r.error ?? "Unknown error")
+                    guard self.rounds.indices.contains(idx) else { return nil }
+                    // The seat's ANSWER is untouched whatever happens here: .failed would turn its
+                    // answer panel to ERROR, and that panel's retry re-asks the answer.
+                    self.status[seat.id] = .idle
+                    self.addRoundUsage(idx, seat, r)
+                    guard r.status == .complete, let text = r.text else {
+                        self.rounds[idx].peerReviews[seat.id] = nil   // only a finished review is kept
+                        return (seat.id, r)
                     }
+                    self.rounds[idx].peerReviews[seat.id] = self.deAnonymize(text, others.remap)
+                    return nil
                 }
             }
+            var out: [Int: StreamResult] = [:]
+            for await item in group { if let (id, r) = item { out[id] = r } }
+            return out
         }
+        peerReviewError = Self.stageErrors(reviewers.compactMap { seat in
+            unfinished[seat.id].map { (name: names[seat.id] ?? "Advisor", result: $0) }
+        })
         deliberationBusy = false
         generatingRound = nil
         pipelineStage = nil
@@ -1130,10 +1365,11 @@ public final class CouncilStore {
         deliberationBusy = true
         generatingRound = idx
         pipelineStage = "Debate"
+        rebuttalError = nil
         for s in rebutters { status[s.id] = .loading; rounds[idx].rebuttals[s.id] = "" }
         let names = uniqueNames(for: all.map { (id: $0.id, base: $0.name) })
 
-        await withTaskGroup(of: Void.self) { group in
+        let unfinished = await withTaskGroup(of: (Int, StreamResult)?.self) { group -> [Int: StreamResult] in
             for seat in rebutters {
                 let myAnswer = rounds[idx].answers[seat.id] ?? ""
                 // Anonymize only the OTHER positions (like peer review) — the guest's answer is in
@@ -1141,51 +1377,32 @@ public final class CouncilStore {
                 // fabricated "I hold my position" line would be dishonest). Including the seat's own
                 // answer in the blind set makes it read its own position as a stranger's — and after
                 // de-anonymization it ends up "agreeing with itself" by name on screen.
-                let others = all.filter { $0.id != seat.id }.shuffled()
-                var remap: [String: String] = [:]
-                let ctx = others.enumerated().map { i, p -> String in
-                    let label = "Advisor \(String(UnicodeScalar(65 + i)!))"
-                    remap[label] = names[p.id] ?? "Advisor"
-                    return "\(label):\n\(p.answer)"
-                }.joined(separator: "\n\n")
-                let prompt = """
-                The council was asked:
-
-                \(rounds[idx].question)
-
-                Your earlier answer:
-
-                \(myAnswer)
-
-                Here is where the other advisors landed (anonymized):
-
-                \(ctx)
-
-                Reconsider in light of the disagreement. If another position exposes a real weakness in \
-                yours, revise — and say what changed and why. If you still hold your position, say so and \
-                give the strongest reason it survives the critique. Be decisive; this is your final take.
-                """
+                let others = blindPositions(all, excluding: seat.id)
+                let prompt = Self.rebuttalRequest(question: rounds[idx].question, ownAnswer: myAnswer, others: others.text)
                 let messages = [ChatMessage.system(systemPrompt(for: seat)), .user(prompt)]
                 group.addTask { @MainActor in
                     let r = await self.streamCall(seat: seat, messages: messages) { partial in
                         self.liveRebuttals[seat.id] = partial   // raw buffer — no rounds churn per tick
                     }
                     self.liveRebuttals[seat.id] = nil
-                    guard self.rounds.indices.contains(idx) else { return }
-                    if let text = r.text, !r.cancelled {
-                        self.rounds[idx].rebuttals[seat.id] = self.deAnonymize(text, remap)
-                        self.status[seat.id] = .idle
-                        self.addRoundUsage(idx, seat, r)
-                    } else if r.cancelled {
-                        self.rounds[idx].rebuttals[seat.id] = nil
-                        self.status[seat.id] = .idle
-                    } else {
-                        self.rounds[idx].rebuttals[seat.id] = nil
-                        self.status[seat.id] = .failed(r.error ?? "Unknown error")
+                    guard self.rounds.indices.contains(idx) else { return nil }
+                    self.status[seat.id] = .idle   // as in peer review: the answer is not what failed
+                    self.addRoundUsage(idx, seat, r)
+                    guard r.status == .complete, let text = r.text else {
+                        self.rounds[idx].rebuttals[seat.id] = nil   // only a finished take is kept
+                        return (seat.id, r)
                     }
+                    self.rounds[idx].rebuttals[seat.id] = self.deAnonymize(text, others.remap)
+                    return nil
                 }
             }
+            var out: [Int: StreamResult] = [:]
+            for await item in group { if let (id, r) = item { out[id] = r } }
+            return out
         }
+        rebuttalError = Self.stageErrors(rebutters.compactMap { seat in
+            unfinished[seat.id].map { (name: names[seat.id] ?? "Advisor", result: $0) }
+        })
         deliberationBusy = false
         generatingRound = nil
         pipelineStage = nil
@@ -1222,30 +1439,26 @@ public final class CouncilStore {
         }
         var blocks: [String] = []
         for p in participants(in: idx) {
-            var b = "\(displayName(p.id)) first said:\n\(p.answer)"
-            if let reb = round.rebuttals[p.id], !reb.isEmpty {
-                b += "\n\n\(displayName(p.id))'s final take after debate:\n\(reb)"
-            } else {
-                // Never let silence read as "held its position": the guest is a static paste and a
-                // seat may simply have failed. Say which it is, and the prompt forbids guessing.
-                b += "\n\n\(displayName(p.id)) did not take part in the debate round, so it has no final take."
-            }
-            blocks.append(b)
+            let reb = round.rebuttals[p.id]
+            blocks.append(Self.chairDebateBlock(name: displayName(p.id), firstSaid: p.answer,
+                                                finalTake: (reb?.isEmpty == false) ? reb : nil))
         }
-        let user = "The council was asked:\n\(round.question)\n\nThe debate:\n\n\(blocks.joined(separator: "\n\n---\n\n"))"
+        let user = Self.chairSummaryRequest(question: round.question, blocks: blocks)
         let r = await streamCall(seat: chair, messages: [.system(Self.chairSummaryPrompt), .user(user)]) { partial in
             self.liveChairSummary = partial   // raw buffer — no rounds churn per tick
         }
         liveChairSummary = nil
         if rounds.indices.contains(idx) {
-            if let t = r.text, !r.cancelled {
+            addRoundUsage(idx, chair, r)
+            if r.status == .complete, let t = r.text {
                 rounds[idx].chairSummary = t
                 // Record WHO chaired: the Settings chair can change later, and a summary must keep
                 // naming the model that actually wrote it.
                 rounds[idx].chairProvider = chair.provider?.panelName
-                addRoundUsage(idx, chair, r)
-            } else if !r.cancelled {
-                chairError = r.error ?? "The chair couldn't write its summary."
+            } else {
+                // Transient, never persisted as content — and an unfinished summary isn't kept.
+                chairError = Self.stageErrors([(name: chair.provider?.panelName ?? "The chair", result: r)])
+                    ?? "The chair couldn't write its summary."
             }
         }
         deliberationBusy = false
@@ -1281,19 +1494,23 @@ public final class CouncilStore {
     /// custom endpoint, a model that isn't pulled) can actually answer is only knowable by calling
     /// it — so the honest design is to try, then fall back and SAY SO (`chairFallbackNote`).
     private func runAuthored(
-        _ messages: [ChatMessage],
+        round idx: Int, _ messages: [ChatMessage],
         onDelta: @MainActor @escaping (String) -> Void
     ) async -> (seat: Seat, result: StreamResult)? {
         guard let first = synthesizerSeat else { return nil }
         let r = await streamCall(seat: first, messages: messages, onDelta: onDelta)
-        let chairFailed = (first.id == Seat.chairID) && r.text == nil && !r.cancelled
+        // Unfinished output is never kept, so a chair that was cut off or went quiet leaves the
+        // round with nothing, just like one that failed: an advisor stands in. A Stop doesn't.
+        let chairFailed = (first.id == Seat.chairID) && r.status != .complete && r.status != .cancelled
         guard chairFailed, let advisor = advisorSynthesizerSeat else {
             if first.id != Seat.chairID { chairFallbackNote = nil }
             return (first, r)
         }
+        addRoundUsage(idx, first, r)   // the chair's attempt was billed, even though it isn't used
         let retry = await streamCall(seat: advisor, messages: messages, onDelta: onDelta)
-        chairFallbackNote = retry.text != nil
-            ? "\(first.provider?.panelName ?? "The chair") couldn't run — \(advisor.provider?.panelName ?? "an advisor") wrote this."
+        let why = r.status == .failed ? "couldn't run" : "didn't finish"
+        chairFallbackNote = retry.status == .complete
+            ? "\(first.provider?.panelName ?? "The chair") \(why) — \(advisor.provider?.panelName ?? "an advisor") wrote this."
             : nil
         return (advisor, retry)
     }
@@ -1308,19 +1525,19 @@ public final class CouncilStore {
         // Don't wipe an existing divergence up front: on a failed REGEN the prior good text stays,
         // and the stream replaces it from the first token on success.
         let (ctx, remap, seatByLabel) = anonymizedContext(idx)
-        let user = "Question:\n\(rounds[idx].question)\n\nThe advisors' answers (anonymized):\n\n\(ctx)"
+        let user = Self.analysisRequest(question: rounds[idx].question, answers: ctx)
         // Capable backends return the map AND its verdict together, halving this stage's calls.
         let merged = synthesizerSeat?.provider?.supportsMergedVerdict ?? false
         let prompt = merged ? Self.divergenceWithVerdictPrompt : Self.divergencePrompt
-        let authored = await runAuthored([.system(prompt), .user(user)]) { partial in
+        let authored = await runAuthored(round: idx, [.system(prompt), .user(user)]) { partial in
             // Never let the machine-readable tail flash on screen mid-stream.
             self.liveDivergence = Self.narrativePart(partial)
         }
         liveDivergence = nil   // a failed/cancelled regen falls back to the prior committed text
         if let (seat, r) = authored, rounds.indices.contains(idx) {
-            if let t = r.text, !r.cancelled {
+            addRoundUsage(idx, seat, r)
+            if r.status == .complete, let t = r.text {
                 rounds[idx].divergence = deAnonymize(Self.narrativePart(t), remap)
-                addRoundUsage(idx, seat, r)
                 // Use the merged verdict when it parsed; otherwise fall back to the separate judge
                 // call, so a backend that ignored the tail costs exactly what it costs today.
                 if !(merged && applyVerdict(Self.parseVerdictJSON(Self.verdictPart(t) ?? ""),
@@ -1328,7 +1545,8 @@ public final class CouncilStore {
                     await computeVerdict(seat: seat, idx: idx, user: user, remap: remap, seatByLabel: seatByLabel)
                 }
             }
-            else if !r.cancelled { divergenceError = r.error ?? "Failed" }   // transient, never persisted as content
+            // Transient, never persisted as content — and a cut-off map isn't kept either.
+            else { divergenceError = Self.stageErrors([(name: seat.provider?.panelName ?? "The analyst", result: r)]) }
         }
         deliberationBusy = false
         pipelineStage = nil
@@ -1343,14 +1561,16 @@ public final class CouncilStore {
         pipelineStage = "Synthesis"
         synthesisError = nil
         let (ctx, remap, _) = anonymizedContext(idx)
-        let context = "Question:\n\(rounds[idx].question)\n\nThe advisors' answers (anonymized):\n\n\(ctx)"
-        let authored = await runAuthored([.system(Self.synthesisPrompt), .user(context)]) { partial in
+        let context = Self.analysisRequest(question: rounds[idx].question, answers: ctx)
+        let authored = await runAuthored(round: idx, [.system(Self.synthesisPrompt), .user(context)]) { partial in
             self.liveSynthesis = partial   // raw buffer — no rounds churn per tick
         }
         liveSynthesis = nil   // a failed/cancelled regen falls back to the prior committed text
         if let (seat, r) = authored, rounds.indices.contains(idx) {
-            if let t = r.text, !r.cancelled { rounds[idx].synthesis = deAnonymize(t, remap); addRoundUsage(idx, seat, r) }
-            else if !r.cancelled { synthesisError = r.error ?? "Failed" }   // transient, never persisted as content
+            addRoundUsage(idx, seat, r)
+            if r.status == .complete, let t = r.text { rounds[idx].synthesis = deAnonymize(t, remap) }
+            // Transient, never persisted as content — and a cut-off synthesis isn't kept either.
+            else { synthesisError = Self.stageErrors([(name: seat.provider?.panelName ?? "The synthesizer", result: r)]) }
         }
         deliberationBusy = false
         pipelineStage = nil
@@ -1373,11 +1593,14 @@ public final class CouncilStore {
         }
         let q = rounds[idx].question
         // Same fold as ask(): the document rides on the request, never into the saved question.
-        let effectiveQ = storedDoc.map { "\(q)\n\n--- ATTACHED DOCUMENT ---\n\n\($0)" } ?? q
-        // Only drop this seat's last exchange from history if it actually succeeded (so a
-        // retry-after-failure doesn't wrongly delete a previous round's exchange).
+        let effectiveQ = storedDoc.map { Self.documentPrompt(q, document: $0) } ?? q
+        // Only drop this seat's last exchange from history if this round's answer is in it: one
+        // that completed (or an older round's, which records no status). A failed, cut-off or
+        // stopped answer never went into history, so dropping "its" pair would delete a PREVIOUS
+        // round's exchange instead.
         let hadAnswer = !((rounds[idx].answers[seatID] ?? "").isEmpty)
-        if hadAnswer, var h = history[seatID], h.count >= 2 { h.removeLast(2); history[seatID] = h }
+        let inHistory = (rounds[idx].answerStatuses[seatID] ?? .complete) == .complete
+        if hadAnswer, inHistory, var h = history[seatID], h.count >= 2 { h.removeLast(2); history[seatID] = h }
         // Changing one answer invalidates every peer review (they all read the old set), the rebuttal
         // round, and both cross-model artifacts — clear them all so nothing stale survives next to
         // the new answer (a surviving rebuttal would also lock DEBATE for this round forever). The
@@ -1385,6 +1608,11 @@ public final class CouncilStore {
         invalidateDeliberation(idx)
         rounds[idx].includedSeatIDs = nil
         rounds[idx].answers[seatID] = ""
+        rounds[idx].answerStatuses[seatID] = nil   // the new answer records its own; no stale marker
+        rounds[idx].answerModels[seatID] = nil
+        // Nor a stale author: a seat moved to another provider whose regenerate fails would still
+        // be named after the one that wrote the answer it replaced (in exports, the memo, the CLI).
+        rounds[idx].answerProviders[seatID] = nil
         status[seatID] = .loading
         generatingRound = idx
         let messages = [ChatMessage.system(systemPrompt(for: seat))] + (history[seatID] ?? []) + [.user(effectiveQ)]
@@ -1392,6 +1620,7 @@ public final class CouncilStore {
             self.setAnswer(idx, seatID, partial)
         }
         finishAnswer(roundIndex: idx, seat: seat, question: q, result: r)
+        excludeIncompleteAnswersByDefault(idx)   // the selection was reset above
         generatingRound = nil
         saveConversation()
     }
@@ -1412,34 +1641,74 @@ public final class CouncilStore {
         (seat.systemPrompt?.isEmpty == false) ? seat.systemPrompt! : sharedSystemPrompt
     }
 
+    /// What peer review can show of the attachment behind a round's answers. Only the round's own
+    /// kept document is sent (so at most `CouncilLimits.maxStoredAttachmentCharacters`); a later
+    /// round doesn't carry an earlier one. Whatever the reviewer can't see is said plainly instead
+    /// of silently left out.
+    private func reviewAttachment(_ idx: Int) -> ReviewAttachment {
+        let round = rounds[idx]
+        if let document = round.attachedDocument { return .document(document) }
+        if round.hadAttachment { return .notKept }
+        return rounds[..<idx].contains(where: \.hadAttachment) ? .notInThisRound : .none
+    }
+
     private func setAnswer(_ idx: Int, _ seatID: Int, _ text: String) {
         // The status guard drops any straggler flush that lands after finishAnswer settled the seat.
         guard rounds.indices.contains(idx), status[seatID] == .loading else { return }
         liveAnswers[seatID] = text   // #15: stream into the live buffer; committed to rounds in finishAnswer
     }
 
+    /// The model id a call on this seat runs: its own, or the provider's default when it names
+    /// none (as the client factory does). nil for a seat with no provider.
+    private func calledModel(_ seat: Seat) -> String? {
+        seat.provider.map { seat.model.isEmpty ? $0.defaultModel : seat.model }
+    }
+
     private func finishAnswer(roundIndex idx: Int, seat: Seat, question: String, result r: StreamResult) {
         guard rounds.indices.contains(idx) else { return }
         let id = seat.id
-        if let text = r.text, !r.cancelled {
+        var ended = r.status
+        // An empty "complete" answer is no answer: committing it would put an empty assistant turn
+        // into this seat's history, which the next follow-up's request would carry.
+        if ended == .complete, r.text?.isEmpty ?? true { ended = .failed }
+        // Recorded however it ended, so a reopened session, an export or the CLI can tell a cut-off
+        // answer from a whole one, and name the model that actually ran.
+        rounds[idx].answerStatuses[id] = ended
+        if let model = calledModel(seat) { rounds[idx].answerModels[id] = model }
+        switch ended {
+        case .complete:
             // Completed normally → commit the answer and extend this seat's conversation history.
+            let text = r.text ?? ""
             rounds[idx].answers[id] = text
             rounds[idx].answerProviders[id] = seat.provider?.panelName
             history[id, default: []].append(.user(question))
             history[id, default: []].append(.assistant(text))
             status[id] = .idle
-            addRoundUsage(idx, seat, r)
-        } else if r.cancelled {
-            // Stopped mid-stream: keep whatever streamed for the user to read, but do NOT append it
-            // to history — feeding a truncated answer into later rounds as if complete corrupts context.
+        case .truncated, .stalled, .cancelled:
+            // Ended early: keep whatever streamed for the user to read, but do NOT append it to
+            // history — feeding a cut-off answer into later rounds as if complete corrupts context.
+            // The recorded status, not a transient error, is what marks it.
             rounds[idx].answers[id] = r.text   // partial text, or nil if nothing arrived yet
-            rounds[idx].answerProviders[id] = seat.provider?.panelName
+            rounds[idx].answerProviders[id] = r.text == nil ? nil : seat.provider?.panelName
             status[id] = .idle
-        } else {
+        case .failed:
             rounds[idx].answers[id] = nil   // hard failure → drop the empty in-progress slot
-            status[id] = .failed(r.error ?? "Unknown error")
+            status[id] = .failed(r.error ?? (r.status == .complete
+                ? "\(seat.provider?.panelName ?? "This advisor") returned an empty answer." : "Unknown error"))
         }
+        addRoundUsage(idx, seat, r)   // whatever was billed, a cut-off answer included
         liveAnswers[id] = nil   // streaming finished → viewedAnswer falls back to the committed rounds value
+    }
+
+    /// An answer that ended early sits out of deliberation by default: a half-answer reviewed,
+    /// scored and named the outlier as if it were a whole position would mislead the council. The
+    /// default is written as the round's selection, so the user can still bring it back in (and
+    /// every surface already shows it as sat out). Runs once the round's answers are in.
+    private func excludeIncompleteAnswersByDefault(_ idx: Int) {
+        guard rounds.indices.contains(idx), rounds[idx].includedSeatIDs == nil else { return }
+        let incomplete = rounds[idx].incompleteSeatIDs
+        guard !incomplete.isEmpty else { return }
+        rounds[idx].includedSeatIDs = rounds[idx].answeredSeatIDs.subtracting(incomplete).sorted()
     }
 
     /// Optional price override (the CouncilKit facade) so a stale built-in price can't silently
@@ -1458,27 +1727,53 @@ public final class CouncilStore {
                              + Double(r.output) / 1_000_000 * rates.outputPer1M
     }
 
-    /// Build the positions for the synthesizer with ANONYMOUS, shuffled labels (Advisor A/B/C) so it
-    /// can't tell which answer is its own and favor it. The guest answer is one more shuffled block —
-    /// indistinguishable from a real advisor. Returns the context plus a map from each anonymous
-    /// label back to the real display name (used to restore attribution in the output).
-    private func anonymizedContext(_ idx: Int) -> (context: String, remap: [String: String], seatByLabel: [String: Int]) {
-        // Derive names from the UNSHUFFLED participant order, then shuffle only the label→participant
-        // assignment. Deriving them post-shuffle made a collision suffix ("Claude (1)"/"Claude (2)")
-        // land on a different seat per stage, so peer review and synthesis disagreed about who was who.
-        let ordered = participants(in: idx)
-        let names = uniqueNames(for: ordered.map { (id: $0.id, base: $0.name) })
-        let parts = ordered.shuffled()
+    /// Test seam: when true, the blind stages keep the participant order instead of shuffling it,
+    /// so a test can pin the exact text a scripted round sends. Internal, and never set outside the
+    /// test target: in production every blind stage shuffles.
+    static var fixedBlindOrderForTesting = false
+
+    /// The order a blind stage labels its positions in: shuffled, so no position (the guest, say)
+    /// always sits at the same letter. Fixed only under the test seam above.
+    private static func blindOrder<T>(_ items: [T]) -> [T] {
+        fixedBlindOrderForTesting ? items : items.shuffled()
+    }
+
+    /// The positions a blind stage reads, each under an anonymous label (Advisor A, B, C…), plus the
+    /// maps back from each label to the real display name (to restore attribution in the output)
+    /// and to the participant (to resolve a verdict's outlier).
+    private struct BlindPositions {
+        let text: String
+        let remap: [String: String]
+        let seatByLabel: [String: Int]   // lowercased label → participant id
+    }
+
+    /// The one place blind labels are assigned, for every blind stage. Names come from the FULL,
+    /// UNSHUFFLED participant list, before anyone is left out or the order is shuffled: deriving them
+    /// after either step moved a collision suffix ("Claude (1)"/"Claude (2)") to a different seat
+    /// per stage, so peer review and synthesis disagreed about who was who. `excluding` leaves out
+    /// the reading seat's own answer (peer review and the debate); `heading` follows each label.
+    private func blindPositions(_ all: [Participant], excluding seatID: Int? = nil,
+                                heading: String = ":") -> BlindPositions {
+        let names = uniqueNames(for: all.map { (id: $0.id, base: $0.name) })
+        let parts = Self.blindOrder(all.filter { $0.id != seatID })
         var blocks: [String] = []
         var remap: [String: String] = [:]
-        var seatByLabel: [String: Int] = [:]   // lowercased label → participant id (verdict outlier resolution)
+        var seatByLabel: [String: Int] = [:]
         for (i, p) in parts.enumerated() {
             let label = "Advisor \(String(UnicodeScalar(65 + i)!))"   // Advisor A, B, C…
             remap[label] = names[p.id] ?? "Advisor"
             seatByLabel[label.lowercased()] = p.id
-            blocks.append("\(label):\n\(p.answer)")
+            blocks.append("\(label)\(heading)\n\(p.answer)")
         }
-        return (blocks.joined(separator: "\n\n"), remap, seatByLabel)
+        return BlindPositions(text: blocks.joined(separator: "\n\n"), remap: remap, seatByLabel: seatByLabel)
+    }
+
+    /// Every position for the synthesizer (and divergence and the verdict) with ANONYMOUS, shuffled
+    /// labels, so it can't tell which answer is its own and favor it. The guest answer is one more
+    /// shuffled block — indistinguishable from a real advisor.
+    private func anonymizedContext(_ idx: Int) -> (context: String, remap: [String: String], seatByLabel: [String: Int]) {
+        let blind = blindPositions(participants(in: idx))
+        return (blind.text, blind.remap, blind.seatByLabel)
     }
 
     /// Put the real provider names back into a generated artifact, for display.
@@ -1490,7 +1785,9 @@ public final class CouncilStore {
     /// Matching is deliberately tolerant, because models echo the label back in their own spelling:
     /// a live llama3.2 run wrote "Adviser A"/"Adviser B" and the strict pass left those raw labels
     /// on screen next to real names — meaningless to the reader. Case, inner whitespace, and that
-    /// one-letter misspelling are all accepted.
+    /// one-letter misspelling are all accepted. A label is a whole word, though: prose such as
+    /// "every advisor agrees" or "the second advisor brings" must never read as "Advisor A"/"B" and
+    /// come out as "every Claudegrees" — which would also pin a council-wide point on one model.
     private func deAnonymize(_ text: String, _ remap: [String: String]) -> String {
         guard !remap.isEmpty else { return text }
         var aliases: [(needle: String, replacement: String)] = []
@@ -1505,7 +1802,9 @@ public final class CouncilStore {
         var out = ""
         var i = text.startIndex
         outer: while i < text.endIndex {
-            for a in aliases {
+            // Only where a word starts: "Advisor A" inside a longer word is ordinary prose.
+            let startsWord = i == text.startIndex || !Self.isWordCharacter(text[text.index(before: i)])
+            for a in aliases where startsWord {
                 if let end = Self.matchLabel(a.needle, in: text, at: i) {
                     out += a.replacement
                     i = end
@@ -1561,8 +1860,19 @@ public final class CouncilStore {
         return true
     }
 
+    /// Whether `c` continues a word next to a label. Only Latin letters and digits do: the label is
+    /// Latin, and so is the prose it can be mistaken for ("advisor agrees", "advisor décide").
+    /// Space, punctuation and an apostrophe end a word, and so does a script that writes without
+    /// spaces or attaches particles ("Advisor A认为", "Advisor Aは", "Advisor A는" still map).
+    private static func isWordCharacter(_ c: Character) -> Bool {
+        guard let scalar = c.unicodeScalars.first, scalar.value < 0x0250 else { return false }
+        return c.isLetter || c.isNumber
+    }
+
     /// Case-insensitive match of `needle` at `start`, where a space in the needle matches any run
-    /// of whitespace. Returns the index just past the match, or nil if it doesn't match here.
+    /// of whitespace, and the match must end a word ("Advisor A." or "Advisor A's", never the
+    /// "advisor a" of "advisor agrees"). Returns the index just past the match, or nil if it
+    /// doesn't match here.
     private static func matchLabel(_ needle: String, in text: String, at start: String.Index) -> String.Index? {
         var t = start
         var n = needle.startIndex
@@ -1578,6 +1888,7 @@ public final class CouncilStore {
             t = text.index(after: t)
             n = needle.index(after: n)
         }
+        guard t == text.endIndex || !isWordCharacter(text[t]) else { return nil }
         return t
     }
 
@@ -1638,24 +1949,68 @@ public final class CouncilStore {
         return (min(100, max(0, a)), camps, outlier)
     }
 
-    public typealias StreamResult = (text: String?, input: Int, output: Int, cancelled: Bool, error: String?)
+    /// What one model call produced. `status` says how it ended: `text` is the whole response when
+    /// complete, what arrived when truncated, stalled or cancelled (nil if nothing did), and nil
+    /// when failed. `error` explains every ending but complete and cancelled. `cancelled` is
+    /// `status == .cancelled`, kept for older readers.
+    public typealias StreamResult = (text: String?, input: Int, output: Int, cancelled: Bool, error: String?,
+                                     status: AnswerStatus)
+
+    /// The one place a `StreamResult` is built, so `cancelled` and `status` can never disagree.
+    private static func streamResult(_ text: String?, _ input: Int, _ output: Int,
+                                     _ status: AnswerStatus, _ error: String? = nil) -> StreamResult {
+        (text, input, output, status == .cancelled, error, status)
+    }
+
+    /// The line a call cut off at the length limit leaves, naming the one fix that works.
+    private static func cutOffMessage(_ name: String, nothingArrived: Bool = false) -> String {
+        nothingArrived
+            ? "\(name) hit the length limit before writing anything — raise this seat's max tokens."
+            : "\(name) was cut off at the length limit — raise this seat's max tokens."
+    }
+
+    /// The error line a deliberation stage leaves for its calls that didn't finish (nil when there
+    /// are none): one line per author, and one for everyone the user stopped. Unfinished stage
+    /// output is never kept, so each line says so — a half-written review or synthesis would read
+    /// as the whole thing on screen, in every export, and on disk.
+    private static func stageErrors(_ unfinished: [(name: String, result: StreamResult)]) -> String? {
+        var lines: [String] = []
+        var stopped: [String] = []
+        for (name, r) in unfinished {
+            switch r.status {
+            case .complete: continue
+            case .cancelled: stopped.append(name)
+            case .truncated: lines.append(cutOffMessage(name) + " Nothing was saved.")
+            case .stalled: lines.append((r.error ?? "\(name) didn't finish.") + " Nothing was saved.")
+            case .failed:
+                // Name the author: one stage card can hold several seats' lines.
+                let m = r.error ?? "it failed."
+                lines.append(m.contains(name) ? m : "\(name): \(m)")
+            }
+        }
+        if !stopped.isEmpty {
+            lines.append("Stopped before \(stopped.joined(separator: ", ")) finished — nothing unfinished was saved.")
+        }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
+    }
 
     /// Test seam: when set, every model call (answers, reviews, debate, divergence, synthesis and
     /// the verdict) goes to this client instead of the real backend, so a test can prove what ran,
     /// and what didn't, without the network. Internal, and never set outside the test target.
     static var clientOverrideForTesting: ((LLMProvider) -> any LLMClient)?
 
-    /// Stream one model call, feeding the growing text to `onDelta`. Returns final text (nil on
-    /// hard failure), token usage, and whether it was cancelled (partial text is kept on cancel).
+    /// Stream one model call, feeding the growing text to `onDelta`. Returns the text, token usage
+    /// and how the call ended (see `StreamResult`): partial text is kept when it was cut off, went
+    /// quiet or was stopped, and dropped only when the call failed outright.
     private func streamCall(seat: Seat, messages: [ChatMessage],
                             onDelta: @MainActor @escaping (String) -> Void) async -> StreamResult {
-        guard let provider = seat.provider else { return (nil, 0, 0, false, "No model selected.") }
+        guard let provider = seat.provider else { return Self.streamResult(nil, 0, 0, .failed, "No model selected.") }
         var apiKey = ""
         if let k = transientKeys[seat.id], !k.isEmpty {
             apiKey = k                                       // facade-supplied key (also auths custom endpoints)
         } else if provider.requiresAPIKey {
             guard let key = (try? KeychainStore.read(account: provider.keychainAccount)) ?? nil,
-                  !key.isEmpty else { return (nil, 0, 0, false, "API key not found.") }
+                  !key.isEmpty else { return Self.streamResult(nil, 0, 0, .failed, "API key not found.") }
             apiKey = key
         }
         let client = Self.clientOverrideForTesting?(provider)
@@ -1673,26 +2028,38 @@ public final class CouncilStore {
             await gate.waitUntilIdle()             // the final flush below must be ordered LAST
             if !r.text.isEmpty { onDelta(r.text) } // authoritative full/partial text, on the MainActor
             switch r.failure {
+            case .none where r.stop == .lengthLimit:
+                // Cut off, not failed: the text is kept and was billed. With nothing written at all
+                // (a reasoning model that spent the cap thinking) there is no answer to keep.
+                return r.text.isEmpty
+                    ? Self.streamResult(nil, r.input, r.output, .failed,
+                                        Self.cutOffMessage(provider.panelName, nothingArrived: true))
+                    : Self.streamResult(r.text, r.input, r.output, .truncated, Self.cutOffMessage(provider.panelName))
             case .none:
-                return (r.text, r.input, r.output, false, nil)
+                return Self.streamResult(r.text, r.input, r.output, .complete)
             case .cancelled:
-                return (r.text.isEmpty ? nil : r.text, r.input, r.output, true, nil)
+                return Self.streamResult(r.text.isEmpty ? nil : r.text, r.input, r.output, .cancelled)
             case .stalled(let m):
                 // Deliberately NOT retried: a backend that went quiet once will almost always go
                 // quiet again, and a second 90s wait is 90s the whole council spends blocked.
-                return (r.text.isEmpty ? nil : r.text, r.input, r.output, false, m)
+                return r.text.isEmpty
+                    ? Self.streamResult(nil, r.input, r.output, .failed, m)
+                    : Self.streamResult(r.text, r.input, r.output, .stalled, m)
+            case .transient where Task.isCancelled:
+                // The connection dropped as the user pressed Stop: that is a stop, not an error.
+                return Self.streamResult(r.text.isEmpty ? nil : r.text, r.input, r.output, .cancelled)
             case .transient(let m):
                 lastMessage = m
-                if attempt == 0, !Task.isCancelled {
+                if attempt == 0 {
                     try? await Task.sleep(nanoseconds: 500_000_000)   // brief backoff, then re-run once
                     continue
                 }
-                return (nil, r.input, r.output, false, m)
+                return Self.streamResult(nil, r.input, r.output, .failed, m)
             case .permanent(let m):
-                return (nil, r.input, r.output, false, m)
+                return Self.streamResult(nil, r.input, r.output, .failed, m)
             }
         }
-        return (nil, 0, 0, false, lastMessage)
+        return Self.streamResult(nil, 0, 0, .failed, lastMessage)
     }
 
     /// The network pump — deliberately `nonisolated`, so it runs on the GLOBAL executor, never the
@@ -1723,11 +2090,18 @@ public final class CouncilStore {
         }
         let watchdog = Task {
             let limit = UInt64(max(1, CouncilLimits.stallTimeoutSeconds) * 1_000_000_000)
+            let thinkingLimit = UInt64(max(1, CouncilLimits.thinkingTimeoutSeconds) * 1_000_000_000)
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 if Task.isCancelled { return }
                 if await liveness.idleNanos() >= limit {
                     await liveness.markTimedOut()
+                    streaming.cancel()
+                    return
+                }
+                // Signs of life alone don't keep a call open for ever (see `thinkingTimeoutSeconds`).
+                if await liveness.stuckNanos() >= thinkingLimit {
+                    await liveness.markTimedOut(stillWorking: true)
                     streaming.cancel()
                     return
                 }
@@ -1740,11 +2114,20 @@ public final class CouncilStore {
         }
         watchdog.cancel()
         // The watchdog cancels the same way Stop does, so the classification is corrected here —
-        // this is the only place that can tell the two apart.
-        if await liveness.timedOut {
-            let secs = Int(CouncilLimits.stallTimeoutSeconds)
-            outcome.failure = .stalled(
-                "\(provider.panelName) stopped responding (nothing for \(secs)s) — the council finished without it.")
+        // this is the only place that can tell the two apart. A stream that had already said how
+        // it ended keeps that verdict, even if it then hung instead of closing.
+        if await liveness.timedOut, outcome.stop == nil {
+            if await liveness.stillWorking {
+                let minutes = max(1, Int((CouncilLimits.thinkingTimeoutSeconds / 60).rounded()))
+                outcome.failure = .stalled(outcome.text.isEmpty
+                    ? "\(provider.panelName) was still working after \(minutes) min with no answer — the council finished without it."
+                    : "\(provider.panelName) stopped writing for \(minutes) min before it finished.")
+            } else {
+                let secs = Int(CouncilLimits.stallTimeoutSeconds)
+                outcome.failure = .stalled(outcome.text.isEmpty
+                    ? "\(provider.panelName) stopped responding (nothing for \(secs)s) — the council finished without it."
+                    : "\(provider.panelName) stopped responding before it finished (nothing for \(secs)s).")
+            }
         }
         return outcome
     }
@@ -1762,11 +2145,15 @@ public final class CouncilStore {
     ) async -> PumpOutcome {
         let minInterval: UInt64 = 100_000_000   // 100ms — 10Hz per seat; 3 seats ≈ 30 UI flushes/sec
         var full = "", input = 0, output = 0
+        var stop: StreamChunk.StopReason?
         var lastEmit: UInt64 = 0
         do {
             for try await chunk in client.stream(messages: messages, apiKey: apiKey) {
-                try Task.checkCancellation()   // Stop → exit → stream terminates → network cancels
-                await liveness.touch()         // proof of life for the stall watchdog
+                // Proof of life for the stall watchdog. A heartbeat proves the call is alive, not
+                // that the answer is getting anywhere: only the other chunks count as progress.
+                let progress: Bool
+                if case .heartbeat = chunk { progress = false } else { progress = true }
+                await liveness.touch(progress: progress)
                 switch chunk {
                 case .text(let t):
                     full += t
@@ -1777,11 +2164,25 @@ public final class CouncilStore {
                         Task { @MainActor in onDelta(snapshot); await gate.leave() }
                     }
                 case .usage(let i, let o): input = i; output = o
+                case .stop(let reason): if stop == nil { stop = reason }
+                case .heartbeat: break         // nothing to keep; the touch above is the point
                 }
+                // Checked after the chunk, not before: an end signal that reached us counts even
+                // when Stop lands at the same moment.
+                try Task.checkCancellation()   // Stop → exit → stream terminates → network cancels
             }
-            return PumpOutcome(text: full, input: input, output: output, failure: nil)
+            // A Stop usually lands here, not in the catch: cancelling a task that is waiting for the
+            // next chunk ends the stream WITHOUT throwing. Only asking the task tells it from a finish.
+            return PumpOutcome(text: full, input: input, output: output,
+                               failure: endFailure(stop, cancelled: Task.isCancelled, text: full, provider: provider),
+                               stop: stop)
         } catch {
             // Partial text survives cancel/failure; classify here so the outcome stays Sendable.
+            // A provider that already said how it ended keeps that verdict: the answer was over.
+            if let stop {
+                return PumpOutcome(text: full, input: input, output: output,
+                                   failure: endFailure(stop, cancelled: false, text: full, provider: provider), stop: stop)
+            }
             let failure: PumpFailure
             if error is CancellationError || (error as? URLError)?.code == .cancelled {
                 failure = .cancelled
@@ -1791,6 +2192,23 @@ public final class CouncilStore {
                 failure = .permanent(friendlyError(error, provider: provider))
             }
             return PumpOutcome(text: full, input: input, output: output, failure: failure)
+        }
+    }
+
+    /// How a stream that ran to its end (or was stopped) is classified. The provider's own end
+    /// signal wins, so a Stop that lands as an answer finishes keeps it complete; with no signal, a
+    /// cancelled task means the user stopped it. A cut-off answer is no failure (`stop` says it).
+    private nonisolated static func endFailure(_ stop: StreamChunk.StopReason?, cancelled: Bool,
+                                               text: String, provider: LLMProvider) -> PumpFailure? {
+        switch stop {
+        case .endedEarly?:
+            return .stalled(text.isEmpty
+                ? "\(provider.panelName)'s connection ended before it answered."
+                : "\(provider.panelName)'s connection ended before it finished.")
+        case .finished?, .lengthLimit?, .unknown?:
+            return nil
+        case nil:
+            return cancelled ? .cancelled : nil
         }
     }
 
@@ -1843,12 +2261,21 @@ public final class CouncilStore {
                   let inc = round.includedSeatIDs, !inc.contains(seatID) else { return "" }
             return " *(sat out of deliberation)*"
         }
+        // An answer that ended early says why, and a seat that was asked but kept nothing says it
+        // did not answer. Rounds saved before 1.3.2 record no status, so they export as before.
+        func ended(_ round: Round, _ seatID: Int) -> String {
+            round.statusLabel(seatID).map { " *(\($0))*" } ?? ""
+        }
         var out = "# Council\n\n"
         for (i, round) in rounds.enumerated() where !round.answeredSeatIDs.isEmpty {
             out += "## Round \(i + 1) — \(round.question)\n\n"
-            for seat in seats where !((round.answers[seat.id] ?? "").isEmpty) {
+            for seat in seats {
                 let model = exportModelTag(seat, round)
-                out += "### \(name(round, seat.id))\(model)\(satOut(round, seat.id))\n\n\(round.answers[seat.id] ?? "")\n\n"
+                if let answer = round.answers[seat.id], !answer.isEmpty {
+                    out += "### \(name(round, seat.id))\(model)\(ended(round, seat.id))\(satOut(round, seat.id))\n\n\(answer)\n\n"
+                } else if didNotAnswer(seat, in: round) {
+                    out += "### \(name(round, seat.id))\(model)\(ended(round, seat.id))\n\n"
+                }
             }
             if let g = round.guestAnswer {
                 out += "### \(round.guestName) — guest (pasted answer)\(satOut(round, Round.guestSeatID))\n\n\(g)\n\n"
@@ -1889,15 +2316,28 @@ public final class CouncilStore {
         return flat.count <= cap ? flat : String(flat.prefix(cap)).trimmingCharacters(in: .whitespaces) + "…"
     }
 
-    /// The " — `model`" tag an export puts after a seat's name. A read-only recording uses the
-    /// model ids recorded with it (none recorded → no tag), never this viewer's seats. Otherwise the
-    /// id is attached only when this seat's current provider is the one that answered.
+    /// The " — `model`" tag an export puts after a seat's name. The model recorded with the answer
+    /// wins: it is what actually ran, whatever the seat runs today. A round saved before 1.3.2
+    /// records none: a read-only recording then uses the model ids recorded with it (none recorded
+    /// → no tag), never this viewer's seats, and any other session attaches the seat's current id
+    /// only when its current provider is the one that answered.
     private func exportModelTag(_ seat: Seat, _ round: Round) -> String {
+        if let m = round.answerModels[seat.id], !m.isEmpty { return " — `\(m)`" }
         if isReadOnlySession {
             guard let m = readOnlyModels[seat.id], !m.isEmpty else { return "" }
             return " — `\(m)`"
         }
         return (seat.provider?.panelName == round.answerProviders[seat.id]) ? " — `\(seat.model)`" : ""
+    }
+
+    /// True when this seat was asked in the round but kept no answer, and it still runs the model
+    /// it was asked with. A seat that failed records no provider, so after a lineup change (or in a
+    /// recording, whose seats aren't this viewer's) the miss can't be pinned on the right advisor:
+    /// the export then leaves it out rather than name the wrong one.
+    private func didNotAnswer(_ seat: Seat, in round: Round) -> Bool {
+        guard !isReadOnlySession, round.answers[seat.id]?.isEmpty ?? true,
+              round.answerStatuses[seat.id] != nil, let model = calledModel(seat) else { return false }
+        return round.answerModels[seat.id] == model
     }
 
     public func exportDecisionMemo() -> String {
@@ -1919,10 +2359,16 @@ public final class CouncilStore {
                   let inc = round.includedSeatIDs, !inc.contains(seatID) else { return "" }
             return " (sat out)"
         }
+        // The same short label as the full export: why an answer is incomplete, or "did not answer".
+        func ended(_ seatID: Int) -> String { round.statusLabel(seatID).map { " (\($0))" } ?? "" }
         out += "## Council\n\n"
-        for seat in seats where round.answers[seat.id]?.isEmpty == false {
+        for seat in seats {
             let model = exportModelTag(seat, round)
-            out += "- \(name(seat.id))\(model)\(satOut(seat.id))\n"
+            if round.answers[seat.id]?.isEmpty == false {
+                out += "- \(name(seat.id))\(model)\(ended(seat.id))\(satOut(seat.id))\n"
+            } else if didNotAnswer(seat, in: round) {
+                out += "- \(name(seat.id))\(model)\(ended(seat.id))\n"
+            }
         }
         if round.guestAnswer != nil {
             out += "- \(round.guestName) — guest (pasted answer)\(satOut(Round.guestSeatID))\n"
@@ -1930,7 +2376,7 @@ public final class CouncilStore {
         out += "\n## Answers (excerpts)\n\n"
         for seat in seats {
             if let a = round.answers[seat.id], !a.isEmpty {
-                out += "**\(name(seat.id)):** \(excerpt(a))\n\n"
+                out += "**\(name(seat.id))\(ended(seat.id)):** \(excerpt(a))\n\n"
             }
         }
         if let g = round.guestAnswer {
@@ -1944,12 +2390,9 @@ public final class CouncilStore {
             if let o = round.outlier { out += "- Outlier: \(o)\n" }
             out += "\n*Measures agreement, not correctness — models can share the same blind spot.*\n\n"
         }
-        if let outlier = round.outlier {
-            let dissentAnswer = round.outlierSeatID.flatMap { round.answers[$0] }
-                ?? round.answerProviders.first { $0.value == outlier }.flatMap { round.answers[$0.key] }
-            if let d = dissentAnswer, !d.isEmpty {
-                out += "## Minority view — \(outlier)\n\n\(excerpt(d, cap: 700))\n\n"
-            }
+        // The memo's round is the viewed one, so this is the same answer the Dissent card shows.
+        if let outlier = round.outlier, let sid = dissentSeatID, let d = round.answers[sid], !d.isEmpty {
+            out += "## Minority view — \(outlier)\(ended(sid))\n\n\(excerpt(d, cap: 700))\n\n"
         }
         if let s = round.synthesis, !s.isEmpty {
             out += "## Synthesis\n\n\(s)\n\n"
@@ -2008,12 +2451,15 @@ public final class CouncilStore {
     private func sessionURL(_ id: UUID) -> URL? {
         Self.sessionsFolderURL?.appendingPathComponent("\(id.uuidString).json")
     }
-    private static var sessionCoder: (enc: JSONEncoder, dec: JSONDecoder) {
+    /// How session files are written and read. Internal so the tests round-trip through it.
+    static var sessionCoder: (enc: JSONEncoder, dec: JSONDecoder) {
         let e = JSONEncoder(); e.dateEncodingStrategy = .iso8601
         let d = JSONDecoder(); d.dateDecodingStrategy = .iso8601
         return (e, d)
     }
 
+    /// Reads every saved session (newest first) and opens the newest one as the current session.
+    /// The app's history read: `init` calls it only for the Council app (see `init(loadHistory:)`).
     public func loadSessions() {
         guard let dir = Self.sessionsFolderURL,
               let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
@@ -2238,11 +2684,14 @@ public final class CouncilStore {
     /// session file (it duplicated every answer's full text); we reconstruct it on load, mirroring how
     /// finishAnswer builds it incrementally — one user(question)+assistant(answer) pair per round the
     /// seat answered, in round order. Sessions saved before this still carry `history`, used as-is.
+    /// Like finishAnswer, it leaves out an answer that ended early; one with no recorded status
+    /// (saved before 1.3.2) counts as complete.
     static func reconstructHistory(from rounds: [Round]) -> [Int: [ChatMessage]] {
         var h: [Int: [ChatMessage]] = [:]
         for r in rounds {
             // The guest sentinel never calls a model, so it has no replay history.
-            for (seatID, answer) in r.answers where !answer.isEmpty && seatID != Round.guestSeatID {
+            for (seatID, answer) in r.answers where !answer.isEmpty && seatID != Round.guestSeatID
+                && (r.answerStatuses[seatID] ?? .complete) == .complete {
                 h[seatID, default: []].append(.user(r.question))
                 h[seatID, default: []].append(.assistant(answer))
             }

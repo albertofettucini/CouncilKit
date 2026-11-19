@@ -1,0 +1,42 @@
+name: CI
+
+# Builds the engine (library + `council` CLI) and runs the unit tests on every push (branches and
+# the bare engine tags, e.g. 0.3.2), every pull request, and on demand. The suite is hermetic: no
+# network, no Keychain, no saved state — so the job needs no secrets and never writes back.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner image"
+        default: "xcode-27"
+        type: choice
+        options: ["xcode-27", "macos-26"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Same image as the app's release build: AppleFoundationClient compiles its FoundationModels
+    # path only when the SDK has it, so an older image would test a different engine than the one
+    # the app ships. macos-26 stays selectable as a fallback via workflow_dispatch.
+    runs-on: ${{ github.event.inputs.runner || 'xcode-27' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false   # nothing here pushes
+
+      - name: Toolchain
+        run: |
+          swift --version
+          xcodebuild -version || true
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test

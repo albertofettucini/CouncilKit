@@ -69,7 +69,9 @@ struct AppleFoundationClient: LLMClient {
                             emitted = cumulative
                         }
 
-                        // The framework doesn't surface token counts. It's free + on-device, so this only
+                        // No stop chunk: the framework doesn't say why a response ended, so an on-device
+                        // answer is never marked cut off. (A Stop is caught by the pump, not here.)
+                        // It doesn't surface token counts either. It's free + on-device, so this only
                         // feeds the (always-$0) usage display — a rough ~4-chars/token estimate.
                         continuation.yield(.usage(input: prompt.count / 4, output: emitted.count / 4))
                         continuation.finish()

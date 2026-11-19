@@ -9,9 +9,13 @@ import CouncilKit
 // MARK: - Output helpers (respect NO_COLOR + non-TTY)
 
 enum Style {
-    static let on = ProcessInfo.processInfo.environment["NO_COLOR"] == nil && isatty(1) != 0
+    /// Color only on a terminal, and never when NO_COLOR is set.
+    static func enabled(environment: [String: String], stdoutIsTTY: Bool) -> Bool {
+        environment["NO_COLOR"] == nil && stdoutIsTTY
+    }
+    static let on = enabled(environment: ProcessInfo.processInfo.environment, stdoutIsTTY: isatty(1) != 0)
     static func bold(_ s: String) -> String { on ? "\u{1B}[1m\(s)\u{1B}[0m" : s }
-    static func dim(_ s: String) -> String { on ? "\u{1B}[2m\(s)\u{1B}[0m" : s }
+    static func dim(_ s: String, color: Bool = Style.on) -> String { color ? "\u{1B}[2m\(s)\u{1B}[0m" : s }
 }
 
 func errPrint(_ s: String) { FileHandle.standardError.write(Data((s + "\n").utf8)) }
@@ -64,7 +68,8 @@ FLAGS
   --md [-o file.md]         decision memo (markdown) on stdout or to a file
   --quiet                   synthesis only (bare text, no headers)
   -v                        include the full peer reviews (the CLI doesn't run the debate round)
-  --fail-above <N>          exit 1 if displayed divergence > N (CI gating)
+  --fail-above <N>          exit 1 if displayed divergence > N (CI gating). An answer that was cut
+                            off or stalled sits out of it unless --deliberate names it
   --no-save                 don't write the session into the app's history
   --allow-env-keys          CI only: COUNCIL_KEY_<PROVIDER> env vars may supply keys. The suffix is
                             the provider id, not the seat name: CLAUDE OPENAI (not GPT) GEMINI
@@ -141,6 +146,272 @@ func provider(named raw: String) -> LLMProvider? {
     }
 }
 
+// MARK: - How each answer and stage ended
+// `r` is always the round this run asked (the store's viewed round).
+
+/// The name the CLI prints a seat under and keys its JSON by: the provider recorded with the
+/// answer, else the seat's current one. Two seats on one provider would share that name and
+/// overwrite each other as JSON keys, so a collision among the round's seats gets "(1)"/"(2)"
+/// in seat order, the same suffix the engine uses.
+@MainActor
+func advisorName(_ store: CouncilStore, _ r: Round?, _ seatID: Int) -> String {
+    func base(_ id: Int) -> String {
+        r?.answerProviders[id] ?? store.seats.first { $0.id == id }?.provider?.panelName ?? "Advisor"
+    }
+    let name = base(seatID)
+    // The round's seats: those that answered or were asked (a status); with no round, every seat.
+    let members = store.seats.map(\.id).filter { id in
+        guard let r else { return true }
+        return r.answers[id] != nil || r.answerStatuses[id] != nil
+    }
+    let same = members.filter { base($0) == name }
+    guard same.count > 1, let n = same.firstIndex(of: seatID) else { return name }
+    return "\(name) (\(n + 1))"
+}
+
+/// The dim tag after an advisor's name when its answer ended early ("" for a whole answer): the
+/// same short label the exports and the memo use. Plain text under NO_COLOR or off a terminal.
+func statusTag(_ label: String?, color: Bool = Style.on) -> String {
+    label.map { " " + Style.dim("(\($0))", color: color) } ?? ""
+}
+
+/// One stderr note per answer that ended early, so a CI log shows it and not only the dim tag:
+/// why it is incomplete, and whether it deliberates (by default it sits out).
+@MainActor
+func incompleteAnswerNotes(_ store: CouncilStore, _ r: Round) -> [String] {
+    let deliberating = store.viewedParticipantIDs
+    return store.seats.compactMap { seat in
+        guard r.incompleteSeatIDs.contains(seat.id), let label = r.statusLabel(seat.id) else { return nil }
+        let fix = r.answerStatuses[seat.id] == .truncated ? " — raise this seat's max tokens" : ""
+        let part = deliberating.contains(seat.id)
+            ? "--deliberate kept it in peer review, divergence and synthesis"
+            : "it sits out of peer review, divergence and synthesis (--deliberate brings it back)"
+        return "\(advisorName(store, r, seat.id))'s answer is \(label)\(fix); \(part)"
+    }
+}
+
+/// Why this run can't deliberate, or nil when it can: fewer than two positions, or fewer than two
+/// FINISHED ones once the answers that ended early sat out (the engine's own predicate decides).
+@MainActor
+func deliberationSkipReason(_ store: CouncilStore, _ r: Round) -> String? {
+    guard !store.canPeerReview else { return nil }
+    let positions = store.viewedParticipantIDs
+    let satOut = r.incompleteSeatIDs.subtracting(positions)
+    guard !satOut.isEmpty, positions.count + satOut.count >= 2 else {
+        return "only one advisor answered — peer review / divergence / synthesis need ≥2"
+    }
+    return "fewer than 2 finished answers — peer review / divergence / synthesis need ≥2"
+        + " (the incomplete \(satOut.count == 1 ? "one" : "ones") sat out; --deliberate brings \(satOut.count == 1 ? "it" : "them") back)"
+}
+
+/// The seat a --deliberate name means: the name this run prints for it ("ollama (2)"), or a
+/// provider name, which takes that provider's seats in order, so a second "ollama" is the second
+/// Ollama seat. nil when the lineup has no such seat. (Without this a provider seated twice could
+/// only ever name its first seat, and a cut-off second one had no way back in.)
+@MainActor
+func deliberateSeat(_ store: CouncilStore, _ r: Round?, named raw: String, taken: Set<Int>) -> Seat? {
+    let wanted = raw.trimmingCharacters(in: .whitespaces).lowercased()
+    if let printed = store.seats.first(where: { $0.provider != nil && advisorName(store, r, $0.id).lowercased() == wanted }) {
+        return printed
+    }
+    guard let p = provider(named: wanted) else { return nil }
+    let seats = store.seats.filter { $0.provider == p }
+    return seats.first { !taken.contains($0.id) } ?? seats.first
+}
+
+/// Applies --deliberate's choice to this run's round and says whether it took. Fewer than two
+/// names never does, as in 1.3.1: the engine also takes a single answer that grows a smaller
+/// selection (the app's way back, one chip at a time), but one position can't deliberate, so the
+/// CLI would report a selection that runs nothing.
+@MainActor
+func applyDeliberateSelection(_ store: CouncilStore, _ ids: Set<Int>) -> Bool {
+    guard ids.count >= 2 else { return false }
+    store.setDeliberationSelection(ids, forRound: store.viewingRound)
+    let r = store.rounds.indices.contains(store.viewingRound) ? store.rounds[store.viewingRound] : nil
+    return r?.includedSeatIDs.map(Set.init) == ids
+}
+
+/// How one stage of this run's deliberation ended, for its stderr notes and the JSON `stages` key.
+struct StageOutcome {
+    /// The JSON key: peerReview, rebuttal, divergence, verdict, synthesis or chair.
+    let key: String
+    /// How a stderr note names the stage.
+    let title: String
+    /// complete · partial (some calls finished, some didn't) · failed (nothing kept) · skipped (didn't run).
+    let status: String
+    /// One line each: the engine's line for a call that didn't finish, or why the stage didn't run.
+    let notes: [String]
+}
+
+/// Every stage, in pipeline order. Unfinished stage output is never kept, so a stage either kept
+/// what finished or nothing. `skipped` is `deliberationSkipReason` (nil when the run deliberated).
+/// The CLI never runs the debate, so `rebuttal` is skipped unless a library caller ran it.
+/// `chair` is the chair moderating divergence and synthesis: skipped when there is none.
+@MainActor
+func stageOutcomes(_ store: CouncilStore, _ r: Round, skipped reason: String?) -> [StageOutcome] {
+    func lines(_ error: String?) -> [String] { (error ?? "").split(separator: "\n").map(String.init) }
+    /// A stage of one or more calls: complete when nothing is reported, else partial or failed.
+    func outcome(_ key: String, _ title: String, kept: Bool, _ error: String?) -> StageOutcome {
+        if let reason { return StageOutcome(key: key, title: title, status: "skipped", notes: [reason]) }
+        let notes = lines(error)
+        if notes.isEmpty, kept { return StageOutcome(key: key, title: title, status: "complete", notes: []) }
+        return StageOutcome(key: key, title: title, status: kept ? "partial" : "failed",
+                            notes: notes.isEmpty ? ["nothing came back"] : notes)
+    }
+    let reviewed = r.peerReviews.values.contains { !$0.isEmpty }
+    let rebutted = r.rebuttals.values.contains { !$0.isEmpty }
+    let mapped = r.divergence != nil, synthesized = r.synthesis != nil
+
+    let verdict: StageOutcome
+    if let reason {
+        verdict = StageOutcome(key: "verdict", title: "divergence verdict", status: "skipped", notes: [reason])
+    } else if !mapped {
+        verdict = StageOutcome(key: "verdict", title: "divergence verdict", status: "skipped",
+                               notes: ["there was no divergence map to judge"])
+    } else {
+        verdict = r.divergenceScore != nil
+            ? StageOutcome(key: "verdict", title: "divergence verdict", status: "complete", notes: [])
+            : StageOutcome(key: "verdict", title: "divergence verdict", status: "failed",
+                           notes: ["no verdict came back, or it couldn't be read"])
+    }
+
+    let chair: StageOutcome
+    if reason != nil || !store.isChairActive {
+        chair = StageOutcome(key: "chair", title: "chair", status: "skipped", notes: [])
+    } else if let note = store.chairFallbackNote {
+        chair = StageOutcome(key: "chair", title: "chair", status: "failed", notes: [note])
+    } else {
+        // Nothing records who wrote a stage, but a chair that ran and finished leaves it kept.
+        let missing = [mapped ? nil : "divergence", synthesized ? nil : "synthesis"].compactMap { $0 }
+        chair = missing.isEmpty
+            ? StageOutcome(key: "chair", title: "chair", status: "complete", notes: [])
+            : StageOutcome(key: "chair", title: "chair", status: missing.count == 2 ? "failed" : "partial",
+                           notes: ["\(store.chairName ?? "The chair") didn't write the \(missing.joined(separator: " or the "))"
+                                   + " — see \(missing.count == 1 ? "that stage's" : "those stages'") note"])
+    }
+
+    return [
+        outcome("peerReview", "peer review", kept: reviewed, store.peerReviewError),
+        rebutted || store.rebuttalError != nil
+            ? outcome("rebuttal", "debate", kept: rebutted, store.rebuttalError)
+            : StageOutcome(key: "rebuttal", title: "debate", status: "skipped", notes: []),
+        outcome("divergence", "divergence", kept: mapped, store.divergenceError),
+        verdict,
+        outcome("synthesis", "synthesis", kept: synthesized, store.synthesisError),
+        chair,
+    ]
+}
+
+/// The stderr notes for the stages that failed or only partly finished, each named.
+func stageNotes(_ outcomes: [StageOutcome]) -> [String] {
+    outcomes.filter { $0.status == "failed" || $0.status == "partial" }
+        .flatMap { s in s.notes.map { "\(s.title): \($0)" } }
+}
+
+/// How --fail-above counted the answers that ended early (nil when none did): an incomplete answer
+/// sits out of the divergence by default, so the gate counts it only when --deliberate named it.
+@MainActor
+func failAboveNote(_ store: CouncilStore, _ r: Round) -> String? {
+    let incomplete = r.incompleteSeatIDs
+    guard !incomplete.isEmpty else { return nil }
+    let deliberating = store.viewedParticipantIDs
+    func answers(_ ids: Set<Int>) -> String {
+        "the incomplete answer\(ids.count == 1 ? "" : "s") from "
+            + ids.sorted().map { advisorName(store, r, $0) }.joined(separator: ", ")
+    }
+    let left = incomplete.subtracting(deliberating), kept = incomplete.intersection(deliberating)
+    var parts: [String] = []
+    if !left.isEmpty { parts.append("leaves out \(answers(left))") }
+    if !kept.isEmpty { parts.append("counts \(answers(kept)) (--deliberate)") }
+    return "--fail-above gates on a divergence that " + parts.joined(separator: " and ")
+}
+
+/// The --json payload, schema council.cli.v1. Keys are only ever added to it, never renamed,
+/// removed or retyped, so a script written against an older CLI keeps working. Added in 1.3.2:
+/// each seats[] entry's `status` and `recordedModel` (the model id recorded with the answer; "" for
+/// the guest); `answerStatus` (every name in `answers`, plus each advisor that was asked and kept
+/// no answer → how it ended); `stages` (each stage's status and notes, see `StageOutcome`); and the
+/// dissent's `status`. Answer statuses are the engine's: complete, truncated, stalled, cancelled, failed.
+@MainActor
+func resultJSON(_ store: CouncilStore, _ r: Round, stages: [StageOutcome],
+                started: String, finished: String) -> [String: Any] {
+    func name(_ seatID: Int) -> String { advisorName(store, r, seatID) }
+    // A seat with no recorded status (a round saved before 1.3.2) counts as complete.
+    func status(_ seatID: Int) -> String { (r.answerStatuses[seatID] ?? .complete).rawValue }
+    var seatsArr: [[String: Any]] = []
+    var answers: [String: String] = [:], reviews: [String: String] = [:], rebuttals: [String: String] = [:]
+    var answerStatus: [String: String] = [:]
+    for seat in store.seats {
+        if let a = r.answers[seat.id], !a.isEmpty {
+            seatsArr.append(["name": name(seat.id), "provider": seat.provider?.rawValue ?? "", "model": seat.model,
+                             "status": status(seat.id), "recordedModel": r.answerModels[seat.id] ?? ""])
+            answers[name(seat.id)] = a
+            answerStatus[name(seat.id)] = status(seat.id)
+        } else if r.answerStatuses[seat.id] != nil {
+            answerStatus[name(seat.id)] = status(seat.id)   // asked, but kept no answer
+        }
+        if let rv = r.peerReviews[seat.id], !rv.isEmpty { reviews[name(seat.id)] = rv }
+        if let rb = r.rebuttals[seat.id], !rb.isEmpty { rebuttals[name(seat.id)] = rb }
+    }
+    var guestKey = r.guestName
+    if let g = r.guestAnswer {
+        // A guest named after a real seat would collide as a dictionary key — disambiguate. A seat
+        // that kept no answer still holds its name in answerStatus, and must keep it.
+        let taken = answers[r.guestName] != nil || answerStatus[r.guestName] != nil
+        let gname = taken ? "\(r.guestName) (guest)" : r.guestName
+        guestKey = gname
+        let pasted = AnswerStatus.complete.rawValue   // the user's own text: nothing to cut off
+        seatsArr.append(["name": gname, "provider": "guest", "model": "", "status": pasted, "recordedModel": ""])
+        answers[gname] = g
+        answerStatus[gname] = pasted
+    }
+    /// The key a participant's answer sits under in this JSON, the guest included.
+    func key(_ seatID: Int) -> String { seatID == Round.guestSeatID ? guestKey : name(seatID) }
+    // The outlier under the same name as its answer's key. The engine names only the answers that
+    // deliberated, so with two seats on one provider and one of them sitting out, its plain
+    // "Claude" would match no key here (or, with three, the wrong one).
+    let outlierName = r.outlier.map { engineName in r.outlierSeatID.map(key) ?? engineName }
+    var obj: [String: Any] = [
+        "schemaVersion": "council.cli.v1",
+        // The round's question, not the raw arg: on the document-only path opts.question is empty
+        // while the round ran with the engine-synthesized "Analyze the attached document."
+        "question": r.question,
+        "startedAt": started, "finishedAt": finished,
+        "seats": seatsArr, "answers": answers,
+        "peerReviews": reviews, "rebuttals": rebuttals,
+        "answerStatus": answerStatus,
+        "stages": Dictionary(uniqueKeysWithValues: stages.map {
+            ($0.key, ["status": $0.status, "notes": $0.notes] as [String: Any])
+        }),
+    ]
+    if let agreement = r.divergenceScore {
+        var d: [String: Any] = ["agreement": agreement, "displayedDivergence": 100 - agreement]
+        if let c = r.divergenceCamps { d["camps"] = c }
+        if let o = outlierName { d["outlier"] = o }
+        if let n = r.divergence { d["narrative"] = n }
+        obj["divergence"] = d
+    }
+    if let s = r.synthesis { obj["synthesis"] = s }
+    if let o = outlierName, let a = store.outlierAnswer {
+        obj["dissent"] = ["name": o, "answer": a, "status": store.dissentSeatID.map(status) ?? AnswerStatus.complete.rawValue]
+    }
+    if let inc = r.includedSeatIDs {
+        obj["deliberatedSeats"] = inc.sorted().map(key)
+    }
+    // Report the chair only when it actually authored something — a configured chair that
+    // couldn't run must not appear in machine output as if it had chaired.
+    if store.chairFallbackNote == nil, store.isChairActive, let cn = store.chairName { obj["chair"] = cn }
+    if let note = store.chairFallbackNote { obj["chairFallback"] = note }
+    if let c = r.chairSummary { obj["chairSummary"] = c }
+    return obj
+}
+
+/// The exact text --json prints.
+func jsonText(_ obj: [String: Any]) -> String {
+    let data = try! JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
+    return String(data: data, encoding: .utf8)!
+}
+
 // MARK: - keys set
 
 @MainActor
@@ -166,6 +437,20 @@ func keysSet(_ name: String) {
 
 // MARK: - Pipeline
 
+/// The run's store. It never reads the app's saved history: a CLI run has no use for it, and
+/// reading meant decoding every session in another app's container. A run that saves writes
+/// exactly one file, its own new session (a fresh id), into that history. Nothing here rewrites,
+/// renames or deletes another session file, and the app decodes each file on its own, so a file
+/// it can't read is skipped, never lost. (Before 1.3.2 a run refused to save when no existing file
+/// decoded. That check needed the whole history loaded, so it is gone with the read.)
+@MainActor
+func cliStore(saving: Bool) -> CouncilStore {
+    let store = CouncilStore(loadHistory: false)
+    store.persistenceEnabled = saving
+    store.newSession()
+    return store
+}
+
 @MainActor
 func run(_ opts: Options) async {
     if opts.allowEnvKeys {
@@ -173,25 +458,13 @@ func run(_ opts: Options) async {
         errPrint("warning: --allow-env-keys is on — COUNCIL_KEY_* env vars may supply API keys (CI mode)")
     }
 
-    let store = CouncilStore()
-    store.persistenceEnabled = !opts.noSave
+    let store = cliStore(saving: !opts.noSave)
 
     // Every exit from here on goes through these two. saveConversation only QUEUES the session's
     // disk write (debounced, then off-thread), so a bare exit() right after the last stage used to
     // drop peer review, divergence and synthesis from the history the app shows.
     func finish(_ code: Int32) -> Never { store.flushPendingWrite(); exit(code) }
     func fail(_ msg: String, code: Int32 = 2) -> Never { store.flushPendingWrite(); die(msg, code: code) }
-
-    // "Verify against an existing session file before writing": if the sessions dir has files but
-    // NONE decoded, our writer may not match the app's schema — don't risk corrupting history.
-    if store.persistenceEnabled,
-       let dir = CouncilStore.sessionsFolderURL,
-       let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil),
-       files.contains(where: { $0.pathExtension == "json" }), store.sessions.isEmpty {
-        errPrint("warning: existing session files could not be decoded — running with --no-save to protect them")
-        store.persistenceEnabled = false
-    }
-    store.newSession()
 
     // Lineup: --config > --seats > the CLI's own last lineup.
     // An explicit CLI lineup is TRANSIENT: apply it for THIS run, but don't let setProvider/applyConfig
@@ -301,9 +574,7 @@ func run(_ opts: Options) async {
         }
         fail("no advisor answered" + (errs.isEmpty ? "" : "\n       " + errs.joined(separator: "\n       ")))
     }
-    func name(_ seatID: Int) -> String {
-        round()?.answerProviders[seatID] ?? store.seats.first { $0.id == seatID }?.provider?.panelName ?? "Advisor"
-    }
+    func name(_ seatID: Int) -> String { advisorName(store, round(), seatID) }
     if !payloadMode && !opts.quiet {
         print(Style.bold("ANSWERS"))
         for seat in store.seats {
@@ -312,7 +583,8 @@ func run(_ opts: Options) async {
                 continue
             }
             let flat = a.replacingOccurrences(of: "\n", with: " ")
-            print("  \(Style.bold(name(seat.id))): \(flat.count > 220 ? String(flat.prefix(220)) + "…" : flat)")
+            let tag = statusTag(round()?.statusLabel(seat.id))
+            print("  \(Style.bold(name(seat.id)))\(tag): \(flat.count > 220 ? String(flat.prefix(220)) + "…" : flat)")
         }
         if let g = round()?.guestAnswer {
             let flat = g.replacingOccurrences(of: "\n", with: " ")
@@ -328,23 +600,36 @@ func run(_ opts: Options) async {
             if n == "guest" {
                 guard round()?.guestAnswer != nil else { fail("--deliberate names 'guest' but no --guest was given", code: 64) }
                 ids.insert(Round.guestSeatID)
-            } else if let p = provider(named: n), let seat = store.seats.first(where: { $0.provider == p }) {
+            } else if let seat = deliberateSeat(store, round(), named: n, taken: ids) {
                 ids.insert(seat.id)
             } else {
                 fail("--deliberate: '\(n)' is not in the lineup", code: 64)
             }
         }
-        store.setDeliberationSelection(ids, forRound: store.viewingRound)
-        if round()?.includedSeatIDs == nil {
-            errPrint("warning: --deliberate not applied (needs ≥2 answered participants) — deliberating over everyone")
+        // Compared with what was asked for: an answer that ended early already set a selection.
+        if !applyDeliberateSelection(store, ids) {
+            let over = round()?.includedSeatIDs == nil ? "everyone" : "every answer that finished"
+            errPrint("warning: --deliberate not applied (needs ≥2 answered participants) — deliberating over \(over)")
         } else {
-            errPrint(Style.dim("deliberating over: \(names.joined(separator: ", "))"))
+            // The seats that were taken, by the names this run prints them under.
+            let applied = ids.sorted().map { $0 == Round.guestSeatID ? "guest" : name($0) }
+            errPrint(Style.dim("deliberating over: \(applied.joined(separator: ", "))"))
         }
     }
 
-    // ≥2 positions AND at least one real advisor to do the reviewing (a guest can't review).
-    let canDeliberate = (round()?.answeredSeatIDs.count ?? 0) >= 2
-        && !((round()?.answeredSeatIDs.subtracting([Round.guestSeatID]).isEmpty) ?? true)
+    // An answer that ended early is kept, tagged, and sits out of deliberation by default: say so
+    // where a CI log shows it, not only in the dim tag.
+    for note in round().map({ incompleteAnswerNotes(store, $0) }) ?? [] { errPrint("note: \(note)") }
+
+    // ≥2 positions AND at least one real advisor to do the reviewing (a guest can't review): the
+    // engine's own predicate, so an answer sitting out isn't counted as a position.
+    let skipReason = round().flatMap { deliberationSkipReason(store, $0) }
+    let canDeliberate = skipReason == nil
+    func stages() -> [StageOutcome] { round().map { stageOutcomes(store, $0, skipped: skipReason) } ?? [] }
+    /// One stderr note per failed or partial stage among `keys`, right after it ran.
+    func noteStages(_ keys: String...) {
+        for line in stageNotes(stages().filter { keys.contains($0.key) }) { errPrint("note: \(line)") }
+    }
 
     // 2 — peer review
     if canDeliberate {
@@ -359,13 +644,18 @@ func run(_ opts: Options) async {
                     }
                 }
             } else {
-                print(Style.dim("PEER REVIEW done — rerun with -v for the full critiques.") + "\n")
+                let review = stages().first { $0.key == "peerReview" }?.status
+                print(Style.dim(review == "failed" ? "PEER REVIEW didn't finish — nothing was kept (see the notes)."
+                    : review == "partial" ? "PEER REVIEW partly done (see the notes) — rerun with -v for the reviews that finished."
+                    : "PEER REVIEW done — rerun with -v for the full critiques.") + "\n")
             }
         }
+        noteStages("peerReview")
 
         // 3 — divergence (+ judge verdict)
         stage("divergence")
         await store.runDivergence()
+        noteStages("divergence", "verdict")
         if let agreement = store.agreementScore {
             let displayed = 100 - agreement
             var line = "DIVERGENCE: \(displayed)/100"
@@ -387,11 +677,12 @@ func run(_ opts: Options) async {
             print(s + "\n")
         }
         // The chair is optional and can fail; the run must say who actually wrote the analysis.
-        if let note = store.chairFallbackNote { errPrint("note: \(note)") }
+        noteStages("synthesis", "chair")
 
         // 5 — dissent
         if let outlier = store.outlierName, let answer = store.outlierAnswer, !payloadMode, !opts.quiet {
-            print(Style.bold("DISSENT — \(outlier) stood apart"))
+            let tag = statusTag(store.dissentSeatID.flatMap { round()?.statusLabel($0) })
+            print(Style.bold("DISSENT — \(outlier) stood apart") + tag)
             let flat = answer.replacingOccurrences(of: "\n", with: " ")
             print("  " + (flat.count > 400 ? String(flat.prefix(400)) + "…" : flat) + "\n")
         }
@@ -401,8 +692,8 @@ func run(_ opts: Options) async {
                 if let rb = store.viewedRebuttal(seat.id) { print("  \(Style.bold(name(seat.id))):\n\(rb)\n") }
             }
         }
-    } else {
-        errPrint("note: only one advisor answered — peer review / divergence / synthesis need ≥2")
+    } else if let skipReason {
+        errPrint("note: \(skipReason)")
     }
 
     let finished = ISO8601DateFormatter().string(from: Date())
@@ -419,50 +710,7 @@ func run(_ opts: Options) async {
         }
     }
     if opts.json, let r = round() {
-        var seatsArr: [[String: Any]] = []
-        var answers: [String: String] = [:], reviews: [String: String] = [:], rebuttals: [String: String] = [:]
-        for seat in store.seats {
-            if let a = r.answers[seat.id], !a.isEmpty {
-                seatsArr.append(["name": name(seat.id), "provider": seat.provider?.rawValue ?? "", "model": seat.model])
-                answers[name(seat.id)] = a
-            }
-            if let rv = r.peerReviews[seat.id], !rv.isEmpty { reviews[name(seat.id)] = rv }
-            if let rb = r.rebuttals[seat.id], !rb.isEmpty { rebuttals[name(seat.id)] = rb }
-        }
-        if let g = r.guestAnswer {
-            // A guest named after a real seat would collide as a dictionary key — disambiguate.
-            let gname = answers[r.guestName] == nil ? r.guestName : "\(r.guestName) (guest)"
-            seatsArr.append(["name": gname, "provider": "guest", "model": ""])
-            answers[gname] = g
-        }
-        var obj: [String: Any] = [
-            "schemaVersion": "council.cli.v1",
-            // The round's question, not the raw arg: on the document-only path opts.question is empty
-            // while the round ran with the engine-synthesized "Analyze the attached document."
-            "question": r.question,
-            "startedAt": started, "finishedAt": finished,
-            "seats": seatsArr, "answers": answers,
-            "peerReviews": reviews, "rebuttals": rebuttals,
-        ]
-        if let agreement = r.divergenceScore {
-            var d: [String: Any] = ["agreement": agreement, "displayedDivergence": 100 - agreement]
-            if let c = r.divergenceCamps { d["camps"] = c }
-            if let o = r.outlier { d["outlier"] = o }
-            if let n = r.divergence { d["narrative"] = n }
-            obj["divergence"] = d
-        }
-        if let s = r.synthesis { obj["synthesis"] = s }
-        if let o = r.outlier, let a = store.outlierAnswer { obj["dissent"] = ["name": o, "answer": a] }
-        if let inc = r.includedSeatIDs {
-            obj["deliberatedSeats"] = inc.sorted().map { $0 == Round.guestSeatID ? r.guestName : name($0) }
-        }
-        // Report the chair only when it actually authored something — a configured chair that
-        // couldn't run must not appear in machine output as if it had chaired.
-        if store.chairFallbackNote == nil, store.isChairActive, let cn = store.chairName { obj["chair"] = cn }
-        if let note = store.chairFallbackNote { obj["chairFallback"] = note }
-        if let c = r.chairSummary { obj["chairSummary"] = c }
-        let data = try! JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
-        print(String(data: data, encoding: .utf8)!)
+        print(jsonText(resultJSON(store, r, stages: stages(), started: started, finished: finished)))
     }
     if opts.quiet && !payloadMode, let s = store.synthesisText {
         print(s)
@@ -470,6 +718,7 @@ func run(_ opts: Options) async {
 
     // CI gate — distinct from runtime errors: missing verdict is a runtime error (can't gate on it).
     if let gate = opts.failAbove {
+        if let note = round().flatMap({ failAboveNote(store, $0) }) { errPrint("note: \(note)") }
         guard let agreement = store.agreementScore else { fail("--fail-above set but no divergence verdict was produced") }
         let displayed = 100 - agreement
         if displayed > gate {
